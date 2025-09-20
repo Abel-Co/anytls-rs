@@ -16,7 +16,7 @@ A Rust implementation of the AnyTLS proxy protocol that attempts to mitigate the
 
 ### Server
 
-```bash
+```shell
 # ./anytls-server -l 0.0.0.0:8443 -p password
 cargo run --bin anytls-server -- -l 0.0.0.0:8443 -p password
 ```
@@ -25,7 +25,7 @@ cargo run --bin anytls-server -- -l 0.0.0.0:8443 -p password
 
 ### Client
 
-```bash
+```shell
 # ./anytls-client -l 127.0.0.1:1080 -s server_ip:port -p password
 cargo run --bin anytls-client -- -l 127.0.0.1:1080 -s server_ip:port -p password
 ```
