@@ -5,6 +5,7 @@ use tokio::time::sleep;
 
 pub struct DeadlineWatcher {
     notify: Arc<Notify>,
+    #[allow(unused)]
     timeout: Duration,
 }
 
