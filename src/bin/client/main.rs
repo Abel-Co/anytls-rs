@@ -103,33 +103,181 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn create_tls_config(_sni: Option<&str>) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
-    let config = ClientConfig::builder()
+    let mut config = ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
     
+    // 使用危险的方法来禁用证书验证
+    config.dangerous().set_certificate_verifier(Arc::new(AllowAnyCertVerifier));
+    
     Ok(Arc::new(config))
+}
+
+// 允许任何证书的验证器
+#[derive(Debug)]
+struct AllowAnyCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for AllowAnyCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA1,
+            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ED448,
+        ]
+    }
 }
 
 async fn handle_connection(
     mut stream: TcpStream,
     client: Arc<Client>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Simplified SOCKS5 handling
-    // In a real implementation, you'd implement full SOCKS5 protocol
-    
-    let _proxy_stream = client.create_stream().await?;
-    
-    // Simple relay - simplified implementation
-    let (mut client_read, mut client_write) = stream.split();
-    
-    // For now, just echo back what we receive
+    // SOCKS5 握手处理
     let mut buffer = vec![0u8; 1024];
-    loop {
-        let n = client_read.read(&mut buffer).await?;
-        if n == 0 {
+    
+    // 读取客户端版本和认证方法
+    let n = stream.read(&mut buffer).await?;
+    if n < 3 {
+        return Err("Invalid SOCKS5 request".into());
+    }
+    
+    let version = buffer[0];
+    let nmethods = buffer[1] as usize;
+    
+    if version != 5 {
+        return Err("Unsupported SOCKS version".into());
+    }
+    
+    if n < 2 + nmethods {
+        return Err("Incomplete SOCKS5 request".into());
+    }
+    
+    // 检查是否支持无认证方法
+    let mut supports_no_auth = false;
+    for i in 2..2 + nmethods {
+        if buffer[i] == 0 {
+            supports_no_auth = true;
             break;
         }
-        client_write.write_all(&buffer[..n]).await?;
+    }
+    
+    if !supports_no_auth {
+        return Err("No supported authentication method".into());
+    }
+    
+    // 发送认证方法选择响应
+    let response = [5, 0]; // 版本5，无认证
+    stream.write_all(&response).await?;
+    
+    // 读取连接请求
+    let n = stream.read(&mut buffer).await?;
+    if n < 10 {
+        return Err("Invalid SOCKS5 connect request".into());
+    }
+    
+    let version = buffer[0];
+    let cmd = buffer[1];
+    let _rsv = buffer[2];
+    let atyp = buffer[3];
+    
+    if version != 5 || cmd != 1 {
+        return Err("Unsupported SOCKS5 command".into());
+    }
+    
+    // 解析目标地址
+    let mut target_addr = String::new();
+    let mut target_port = 0;
+    
+    match atyp {
+        1 => { // IPv4
+            if n < 10 {
+                return Err("Incomplete IPv4 address".into());
+            }
+            target_addr = format!("{}.{}.{}.{}", buffer[4], buffer[5], buffer[6], buffer[7]);
+            target_port = u16::from_be_bytes([buffer[8], buffer[9]]);
+        }
+        3 => { // 域名
+            let domain_len = buffer[4] as usize;
+            if n < 5 + domain_len + 2 {
+                return Err("Incomplete domain address".into());
+            }
+            target_addr = String::from_utf8_lossy(&buffer[5..5 + domain_len]).to_string();
+            target_port = u16::from_be_bytes([buffer[5 + domain_len], buffer[5 + domain_len + 1]]);
+        }
+        _ => return Err("Unsupported address type".into()),
+    }
+    
+    let target = format!("{}:{}", target_addr, target_port);
+    log::info!("Connecting to target: {}", target);
+    
+    // 创建到代理服务器的连接
+    let _proxy_stream = client.create_stream().await?;
+    
+    // 发送连接成功响应
+    let response = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]; // 成功响应
+    stream.write_all(&response).await?;
+    
+    // 建立到目标服务器的连接
+    let mut target_stream = match TcpStream::connect(&target).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            // 发送连接失败响应
+            let response = [5, 1, 0, 1, 0, 0, 0, 0, 0, 0]; // 连接失败
+            let _ = stream.write_all(&response).await;
+            return Err(e.into());
+        }
+    };
+    
+    // 开始数据转发
+    let (mut client_read, mut client_write) = stream.split();
+    let (mut target_read, mut target_write) = target_stream.split();
+    
+    // 双向数据转发
+    tokio::select! {
+        _ = tokio::io::copy(&mut client_read, &mut target_write) => {
+            log::debug!("Client to target stream ended");
+        }
+        _ = tokio::io::copy(&mut target_read, &mut client_write) => {
+            log::debug!("Target to client stream ended");
+        }
     }
     
     Ok(())
