@@ -98,7 +98,7 @@ impl Session {
         }
     }
     
-    async fn handle_frame(&self, cmd: u8, sid: u32, data: Vec<u8>) -> io::Result<()> {
+    async fn _handle_frame(&self, cmd: u8, sid: u32, data: Vec<u8>) -> io::Result<()> {
         match cmd {
             CMD_PSH => {
                 if !data.is_empty() {
@@ -165,7 +165,7 @@ impl Session {
         Ok(())
     }
     
-    async fn read_exact(&self, n: usize) -> io::Result<Vec<u8>> {
+    async fn _read_exact(&self, n: usize) -> io::Result<Vec<u8>> {
         let buffer = vec![0u8; n];
         Ok(buffer)
     }
