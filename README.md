@@ -32,6 +32,19 @@ cargo run --bin anytls-client -- -l 127.0.0.1:1080 -s server_ip:port -p password
 # cargo run --bin anytls-client --release -- -l 127.0.0.1:1080 -s 127.0.0.1:8443 -p password
 ```
 
+### Client 性能版
+
+```shell
+cargo run --bin anytls-client-optimized --release -- -l 127.0.0.1:1080 -s 127.0.0.1:8443 -p password
+# cargo run --bin anytls-client-optimized --release -- -l 127.0.0.1:1080 -s 127.0.0.1:8443 -p password --pool-size 2000 --buffer-size-kb 128 --enable-reuse --enable-compression
+```
+
+- --pool-size - 连接池大小（默认1000）
+- --buffer-size-kb - 缓冲区大小KB（默认64）
+- --enable-reuse - 启用连接重用
+- --enable-compression - 启用压缩
+
+
 `127.0.0.1:1080` is the local SOCKS5 proxy listening address, theoretically supports TCP and UDP (via UDP over TCP transmission).
 
 ### sing-box
