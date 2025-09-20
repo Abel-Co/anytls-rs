@@ -14,32 +14,89 @@ name = "anytls-client"
 path = "src/bin/client/main.rs"
 
 [[bin]]
+name = "anytls-client-optimized"
+path = "src/bin/client_optimized.rs"
+
+[[bin]]
 name = "anytls-server"
 path = "src/bin/server/main.rs"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
+# 基础异步运行时
+tokio = { version = "1.0", features = ["full", "rt-multi-thread", "net", "io-util", "sync", "time"] }
+# tokio-uring = "0.4"  # 高性能异步I/O. # 暂时注释掉
 tokio-rustls = "0.25"
 rustls = "0.22"
 rustls-pemfile = "2.0"
 rcgen = "0.13"
 x509-parser = "0.17"
+
+# 零拷贝和内存优化
+bytes = "1.0"
+memmap2 = "0.9"  # 内存映射
+zerocopy = "0.8"  # 零拷贝序列化
+bytemuck = "1.0"  # 零拷贝转换
+
+# eBPF集成 (可选，需要内核支持)(# 暂时注释掉)
+# libbpf-rs = "0.24"  # eBPF支持
+# libbpf-sys = "1.4"
+
+# 高性能数据结构
+crossbeam = "0.8"  # 无锁数据结构
+dashmap = "5.0"
+indexmap = "2.0"
+parking_lot = "0.12"
+mimalloc = { version = "0.1", default-features = false }  # 高性能内存分配器
+
+# SIMD优化 (暂时注释掉，有编译问题)
+# simd = "0.2"  # SIMD指令
+# wide = "0.6"  # 向量化操作
+
+# 网络优化
+socket2 = "0.5"
+nix = "0.27"  # 系统调用
+# io-uring = "0.6"  # 异步I/O (暂时注释掉)
+
+# 序列化和压缩
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"  # 高性能二进制序列化
+zstd = "0.13"  # 压缩
+
+# 加密和哈希
+md5 = "0.7"
+sha2 = "0.10"
+aes-gcm = "0.10"  # 高性能加密
+chacha20poly1305 = "0.10"
+
+# 工具库
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-md5 = "0.7"
-sha2 = "0.10"
 rand = "0.8"
 thiserror = "1.0"
-bytes = "1.0"
 futures = "0.3"
 async-trait = "0.1"
 url = "2.0"
 hex = "0.4"
 base64 = "0.22"
-parking_lot = "0.12"
-dashmap = "5.0"
-indexmap = "2.0"
+
+# 内存管理
+bumpalo = "3.0"  # 高性能内存池
+slab = "0.4"  # 对象池
+
+# 性能监控
+# perf-event = "0.4"  # 性能计数器
+
+[profile.release]
+# 最高性能优化
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# 启用所有优化
+[profile.release.package."*"]
+opt-level = 3

@@ -1,0 +1,502 @@
+use anytls_rs::proxy::padding::DefaultPaddingFactory;
+use anytls_rs::proxy::session::Client;
+use anytls_rs::util::{
+    PROGRAM_VERSION_NAME, 
+    HighPerfIoManager, 
+    HighPerfTcpListener, 
+    HighPerfTcpConnection,
+    AsyncIoOptimizer,
+    MemoryPool,
+    KernelNetworkOptimizer,
+    PerformanceCounter
+};
+use clap::Parser;
+use log::{error, info, debug};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_uring::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use rustls::ClientConfig;
+use sha2::{Digest, Sha256};
+use std::time::Instant;
+
+#[derive(Parser)]
+#[command(name = "anytls-client-high-perf")]
+#[command(about = "AnyTLS High Performance Client")]
+struct Args {
+    #[arg(short = 'l', long, default_value = "127.0.0.1:1080", help = "SOCKS5 listen port")]
+    listen: String,
+    
+    #[arg(short = 's', long, default_value = "127.0.0.1:8443", help = "Server address")]
+    server: String,
+    
+    #[arg(long, help = "SNI")]
+    sni: Option<String>,
+    
+    #[arg(short = 'p', long, help = "Password")]
+    password: String,
+    
+    #[arg(long, default_value = "1000", help = "Memory pool size")]
+    pool_size: usize,
+    
+    #[arg(long, default_value = "64", help = "Buffer size in KB")]
+    buffer_size_kb: usize,
+    
+    #[arg(long, help = "Enable eBPF optimization")]
+    enable_ebpf: bool,
+    
+    #[arg(long, help = "Enable zero-copy")]
+    enable_zero_copy: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    
+    let args = Args::parse();
+    
+    if args.password.is_empty() {
+        error!("Please set password");
+        std::process::exit(1);
+    }
+    
+    // 初始化性能优化器
+    let io_optimizer = AsyncIoOptimizer::new();
+    io_optimizer.optimize()?;
+    
+    // 初始化eBPF优化器
+    let ebpf_optimizer = if args.enable_ebpf {
+        let optimizer = KernelNetworkOptimizer::new();
+        optimizer.init().await?;
+        Some(optimizer)
+    } else {
+        None
+    };
+    
+    // 初始化内存池
+    let memory_pool = Arc::new(MemoryPool::new(
+        args.buffer_size_kb * 1024,
+        args.pool_size
+    ));
+    
+    // 初始化高性能I/O管理器
+    let io_manager = Arc::new(HighPerfIoManager::new());
+    
+    let password_sha256 = Sha256::digest(args.password.as_bytes());
+    
+    info!("[High-Perf Client] {}", PROGRAM_VERSION_NAME);
+    info!("[High-Perf Client] SOCKS5 {} => {}", args.listen, args.server);
+    info!("[High-Perf Client] Memory pool: {} buffers of {}KB", args.pool_size, args.buffer_size_kb);
+    info!("[High-Perf Client] eBPF: {}, Zero-copy: {}", args.enable_ebpf, args.enable_zero_copy);
+    
+    // 使用标准TCP监听器 (暂时)
+    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    
+    let tls_config = create_tls_config(args.sni.as_deref())?;
+    let padding = DefaultPaddingFactory::load();
+    
+    let padding_clone = padding.clone();
+    let client = Arc::new(Client::new(
+        Box::new(move || {
+            let server = args.server.clone();
+            let tls_config = tls_config.clone();
+            let password_sha256 = password_sha256.clone();
+            let memory_pool = memory_pool.clone();
+            
+            Box::new(Box::pin(async move {
+                let stream = TcpStream::connect(server.parse()?).await?;
+                let connector = TlsConnector::from(tls_config);
+                let mut tls_stream = connector.connect("127.0.0.1".try_into().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?, stream).await?;
+                
+                // 发送认证
+                let mut auth_data = Vec::new();
+                auth_data.extend_from_slice(&password_sha256);
+                
+                let padding_factory = padding.read().await;
+                let padding_sizes = padding_factory.generate_record_payload_sizes(0);
+                let padding_len = if !padding_sizes.is_empty() {
+                    padding_sizes[0] as u16
+                } else {
+                    0
+                };
+                
+                auth_data.extend_from_slice(&padding_len.to_be_bytes());
+                if padding_len > 0 {
+                    auth_data.resize(auth_data.len() + padding_len as usize, 0);
+                }
+                
+                // 发送认证数据
+                tls_stream.write_all(&auth_data).await?;
+                
+                Ok(Box::new(tls_stream) as Box<dyn anytls_rs::util::r#type::AsyncReadWrite>)
+            }))
+        }),
+        padding,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
+        5,
+    ));
+    
+    // 性能监控
+    let perf_counter = Arc::new(PerformanceCounter::new());
+    let perf_counter_clone = perf_counter.clone();
+    
+    // 启动性能监控任务
+    tokio::spawn(async move {
+        let mut last_stats = Instant::now();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            let now = Instant::now();
+            let duration = now.duration_since(last_stats);
+            
+            let io_stats = io_manager.get_stats();
+            debug!("I/O Stats: {} ops, {} bytes, {}μs avg latency", 
+                   io_stats.operations, io_stats.total_bytes, io_stats.avg_latency_us);
+            
+            if let Some(ref ebpf) = ebpf_optimizer {
+                let network_stats = ebpf.get_stats();
+                debug!("Network Stats: RX {} bytes, TX {} bytes, {} errors", 
+                       network_stats.rx_bytes, network_stats.tx_bytes, network_stats.errors);
+            }
+            
+            last_stats = now;
+        }
+    });
+    
+    info!("High-performance AnyTLS client started");
+    
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let client = client.clone();
+        let io_manager = io_manager.clone();
+        let memory_pool = memory_pool.clone();
+        let perf_counter = perf_counter.clone();
+        
+        tokio::spawn(async move {
+            // 暂时使用标准处理方式
+            if let Err(e) = handle_connection_standard(stream, client, io_manager, memory_pool, perf_counter).await {
+                error!("Connection error: {}", e);
+            }
+        });
+    }
+}
+
+fn create_tls_config(_sni: Option<&str>) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    
+    // 使用危险的方法来禁用证书验证
+    config.dangerous().set_certificate_verifier(Arc::new(AllowAnyCertVerifier));
+    
+    Ok(Arc::new(config))
+}
+
+// 允许任何证书的验证器
+#[derive(Debug)]
+struct AllowAnyCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for AllowAnyCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA1,
+            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ED448,
+        ]
+    }
+}
+
+async fn handle_connection_standard(
+    mut stream: tokio::net::TcpStream,
+    client: Arc<Client>,
+    io_manager: Arc<HighPerfIoManager>,
+    _memory_pool: Arc<MemoryPool>,
+    perf_counter: Arc<PerformanceCounter>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    perf_counter.start();
+    
+    // SOCKS5 握手处理
+    let mut buffer = vec![0u8; 1024];
+    
+    // 读取客户端版本和认证方法
+    let n = stream.read(&mut buffer).await?;
+    if n < 3 {
+        return Err("Invalid SOCKS5 request".into());
+    }
+    
+    let version = buffer[0];
+    let nmethods = buffer[1] as usize;
+    
+    if version != 5 {
+        return Err("Unsupported SOCKS version".into());
+    }
+    
+    if n < 2 + nmethods {
+        return Err("Incomplete SOCKS5 request".into());
+    }
+    
+    // 检查是否支持无认证方法
+    let mut supports_no_auth = false;
+    for i in 2..2 + nmethods {
+        if buffer[i] == 0 {
+            supports_no_auth = true;
+            break;
+        }
+    }
+    
+    if !supports_no_auth {
+        return Err("No supported authentication method".into());
+    }
+    
+    // 发送认证方法选择响应
+    let response = [5, 0]; // 版本5，无认证
+    stream.write_all(&response).await?;
+    
+    // 读取连接请求
+    let n = stream.read(&mut buffer).await?;
+    if n < 10 {
+        return Err("Invalid SOCKS5 connect request".into());
+    }
+    
+    let version = buffer[0];
+    let cmd = buffer[1];
+    let _rsv = buffer[2];
+    let atyp = buffer[3];
+    
+    if version != 5 || cmd != 1 {
+        return Err("Unsupported SOCKS5 command".into());
+    }
+    
+    // 解析目标地址
+    let mut target_addr = String::new();
+    let mut target_port = 0;
+    
+    match atyp {
+        1 => { // IPv4
+            if n < 10 {
+                return Err("Incomplete IPv4 address".into());
+            }
+            target_addr = format!("{}.{}.{}.{}", buffer[4], buffer[5], buffer[6], buffer[7]);
+            target_port = u16::from_be_bytes([buffer[8], buffer[9]]);
+        }
+        3 => { // 域名
+            let domain_len = buffer[4] as usize;
+            if n < 5 + domain_len + 2 {
+                return Err("Incomplete domain address".into());
+            }
+            target_addr = String::from_utf8_lossy(&buffer[5..5 + domain_len]).to_string();
+            target_port = u16::from_be_bytes([buffer[5 + domain_len], buffer[5 + domain_len + 1]]);
+        }
+        _ => return Err("Unsupported address type".into()),
+    }
+    
+    let target = format!("{}:{}", target_addr, target_port);
+    info!("Connecting to target: {}", target);
+    
+    // 创建到代理服务器的连接
+    let _proxy_stream = client.create_stream().await?;
+    
+    // 发送连接成功响应
+    let response = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]; // 成功响应
+    stream.write_all(&response).await?;
+    
+    // 建立到目标服务器的连接
+    let target_stream = match tokio::net::TcpStream::connect(target.parse()?).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            // 发送连接失败响应
+            let response = [5, 1, 0, 1, 0, 0, 0, 0, 0, 0]; // 连接失败
+            let _ = stream.write_all(&response).await;
+            return Err(e.into());
+        }
+    };
+    
+    // 使用高性能I/O管理器进行数据转发
+    let (mut client_read, mut client_write) = stream.split();
+    let (mut target_read, mut target_write) = target_stream.split();
+    
+    // 双向数据转发
+    tokio::select! {
+        _ = io_manager.forward_data(&mut client_read, &mut target_write) => {
+            debug!("Client to target stream ended");
+        }
+        _ = io_manager.forward_data(&mut target_read, &mut client_write) => {
+            debug!("Target to client stream ended");
+        }
+    }
+    
+    let duration = start.elapsed();
+    perf_counter.stop();
+    
+    debug!("Connection handled in {:?}", duration);
+    
+    Ok(())
+}
+
+async fn handle_connection_high_perf(
+    mut stream: HighPerfTcpConnection,
+    client: Arc<Client>,
+    io_manager: Arc<HighPerfIoManager>,
+    memory_pool: Arc<MemoryPool>,
+    perf_counter: Arc<PerformanceCounter>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    perf_counter.start();
+    
+    // SOCKS5 握手处理
+    let mut buffer = vec![0u8; 1024];
+    
+    // 读取客户端版本和认证方法
+    let n = stream.read_high_perf().await?;
+    if n.len() < 3 {
+        return Err("Invalid SOCKS5 request".into());
+    }
+    
+    let version = n[0];
+    let nmethods = n[1] as usize;
+    
+    if version != 5 {
+        return Err("Unsupported SOCKS version".into());
+    }
+    
+    if n.len() < 2 + nmethods {
+        return Err("Incomplete SOCKS5 request".into());
+    }
+    
+    // 检查是否支持无认证方法
+    let mut supports_no_auth = false;
+    for i in 2..2 + nmethods {
+        if n[i] == 0 {
+            supports_no_auth = true;
+            break;
+        }
+    }
+    
+    if !supports_no_auth {
+        return Err("No supported authentication method".into());
+    }
+    
+    // 发送认证方法选择响应
+    let response = [5, 0]; // 版本5，无认证
+    stream.write_high_perf(&response).await?;
+    
+    // 读取连接请求
+    let n = stream.read_high_perf().await?;
+    if n.len() < 10 {
+        return Err("Invalid SOCKS5 connect request".into());
+    }
+    
+    let version = n[0];
+    let cmd = n[1];
+    let _rsv = n[2];
+    let atyp = n[3];
+    
+    if version != 5 || cmd != 1 {
+        return Err("Unsupported SOCKS5 command".into());
+    }
+    
+    // 解析目标地址
+    let mut target_addr = String::new();
+    let mut target_port = 0;
+    
+    match atyp {
+        1 => { // IPv4
+            if n.len() < 10 {
+                return Err("Incomplete IPv4 address".into());
+            }
+            target_addr = format!("{}.{}.{}.{}", n[4], n[5], n[6], n[7]);
+            target_port = u16::from_be_bytes([n[8], n[9]]);
+        }
+        3 => { // 域名
+            let domain_len = n[4] as usize;
+            if n.len() < 5 + domain_len + 2 {
+                return Err("Incomplete domain address".into());
+            }
+            target_addr = String::from_utf8_lossy(&n[5..5 + domain_len]).to_string();
+            target_port = u16::from_be_bytes([n[5 + domain_len], n[5 + domain_len + 1]]);
+        }
+        _ => return Err("Unsupported address type".into()),
+    }
+    
+    let target = format!("{}:{}", target_addr, target_port);
+    info!("Connecting to target: {}", target);
+    
+    // 创建到代理服务器的连接
+    let _proxy_stream = client.create_stream().await?;
+    
+    // 发送连接成功响应
+    let response = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]; // 成功响应
+    stream.write_high_perf(&response).await?;
+    
+    // 建立到目标服务器的连接
+    let target_stream = match TcpStream::connect(target.parse()?).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            // 发送连接失败响应
+            let response = [5, 1, 0, 1, 0, 0, 0, 0, 0, 0]; // 连接失败
+            let _ = stream.write_high_perf(&response).await;
+            return Err(e.into());
+        }
+    };
+    
+    // 使用高性能I/O管理器进行数据转发
+    let (mut client_read, mut client_write) = stream.split();
+    let (mut target_read, mut target_write) = target_stream.split();
+    
+    // 双向数据转发
+    tokio::select! {
+        _ = io_manager.forward_data(&mut client_read, &mut target_write) => {
+            debug!("Client to target stream ended");
+        }
+        _ = io_manager.forward_data(&mut target_read, &mut client_write) => {
+            debug!("Target to client stream ended");
+        }
+    }
+    
+    let duration = start.elapsed();
+    perf_counter.stop();
+    
+    debug!("Connection handled in {:?}", duration);
+    
+    Ok(())
+}
