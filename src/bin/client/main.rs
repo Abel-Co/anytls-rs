@@ -223,8 +223,8 @@ async fn handle_connection(
     }
     
     // 解析目标地址
-    let mut target_addr = String::new();
-    let mut target_port = 0;
+    let target_addr: String;
+    let target_port: u16;
     
     match atyp {
         1 => { // IPv4
