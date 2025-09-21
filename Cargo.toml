@@ -17,9 +17,9 @@ path = "src/bin/client/main.rs"
 name = "anytls-client-optimized"
 path = "src/bin/client_optimized.rs"
 
-[[bin]]
-name = "anytls-server"
-path = "src/bin/server/main.rs"
+# [[bin]]
+# name = "anytls-server"
+# path = "src/bin/server/main.rs"
 
 [dependencies]
 # 基础异步运行时
@@ -46,6 +46,7 @@ crossbeam = "0.8"  # 无锁数据结构
 dashmap = "5.0"
 indexmap = "2.0"
 parking_lot = "0.12"
+atomic = "0.5"  # 原子操作
 mimalloc = { version = "0.1", default-features = false }  # 高性能内存分配器
 
 # SIMD优化 (暂时注释掉，有编译问题)
