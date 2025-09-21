@@ -124,6 +124,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
+ "atomic",
  "base64",
  "bincode",
  "bumpalo",
@@ -210,6 +211,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "atomic"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c59bdb34bc650a32731b31bd8f0829cc15d24a708ee31559e0bb34f2bc320cba"
 
 [[package]]
 name = "autocfg"

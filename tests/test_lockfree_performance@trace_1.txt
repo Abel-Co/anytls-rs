@@ -1,0 +1,199 @@
+➜  tests git:(main) ✗ ./test_lockfree_performance.sh
+⚡ AnyTLS 无锁连接池性能测试
+================================
+
+📦 编译项目...
+
+🧪 开始性能对比测试...
+
+🔒 测试原始锁版本
+🔧 测试 原始锁版本 (类型: lock)
+----------------------------------------
+✅ Server 已启动 (PID: 65832, 类型: lock)
+✅ Client 已启动 (PID: 65834)
+🚀 开始性能测试...
+  📊 第一轮：建立新连接
+  🔗 [1.1] HTTPBin GET
+    ✅ 成功 (Duration: 0 ms)
+  🔗 [1.2] HTTPBin IP
+    ✅ 成功 (Duration: 10 ms)
+  🔗 [1.3] HTTPBin User-Agent
+    ✅ 成功 (Duration: 10 ms)
+  📊 第二轮：连接重用
+  🔗 [2.1] HTTPBin GET
+    ✅ 成功 (Duration: 0 ms)
+  🔗 [2.2] HTTPBin IP
+    ✅ 成功 (Duration: 10 ms)
+  🔗 [2.3] HTTPBin User-Agent
+    ✅ 成功 (Duration: 0 ms)
+  📊 第三轮：并发连接
+  🔗 [3.1] 并发测试 1
+  🔗 [3.2] 并发测试 2
+  🔗 [3.3] 并发测试 3
+  🔗 [3.5] 并发测试 5
+  🔗 [3.4] 并发测试 4
+    ✅ 成功 (Duration: 20 ms)
+    ✅ 成功 (Duration: 20 ms)
+    ✅ 成功 (Duration: 20 ms)
+    ✅ 成功 (Duration: 20 ms)
+  📊 第四轮：压力测试
+  🔗 [4.1] 压力测试 1
+  🔗 [4.2] 压力测试 2
+  🔗 [4.3] 压力测试 3
+  🔗 [4.4] 压力测试 4
+  🔗 [4.5] 压力测试 5
+  🔗 [4.6] 压力测试 6
+  🔗 [4.7] 压力测试 7
+  🔗 [4.8] 压力测试 8
+  🔗 [4.9] 压力测试 9
+  🔗 [4.10] 压力测试 10
+    ✅ 成功 (Duration: 30 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+  ✅ 原始锁版本 测试完成
+
+🛑 停止服务...
+./test_lockfree_performance.sh: line 58: 65832 Terminated: 15          RUST_LOG=warn $binaries_path/anytls-server --listen 0.0.0.0:8443 --password "test123" --max-outbound-connections 50 --max-idle-time-secs 60 --min-idle-connections 3 --pool-type "$pool_type"
+./test_lockfree_performance.sh: line 58: 65834 Terminated: 15          RUST_LOG=warn $binaries_path/anytls-client-optimized --listen 127.0.0.1:1080 --server 127.0.0.1:8443 --password "test123"
+----------------------------------------
+
+⚡ 测试无锁版本
+🔧 测试 无锁版本 (类型: lockfree)
+----------------------------------------
+✅ Server 已启动 (PID: 66033, 类型: lockfree)
+✅ Client 已启动 (PID: 66035)
+🚀 开始性能测试...
+  📊 第一轮：建立新连接
+  🔗 [1.1] HTTPBin GET
+    ✅ 成功 (Duration: 10 ms)
+  🔗 [1.2] HTTPBin IP
+    ✅ 成功 (Duration: 0 ms)
+  🔗 [1.3] HTTPBin User-Agent
+    ✅ 成功 (Duration: 10 ms)
+  📊 第二轮：连接重用
+  🔗 [2.1] HTTPBin GET
+    ✅ 成功 (Duration: 10 ms)
+  🔗 [2.2] HTTPBin IP
+    ✅ 成功 (Duration: 0 ms)
+  🔗 [2.3] HTTPBin User-Agent
+    ✅ 成功 (Duration: 10 ms)
+  📊 第三轮：并发连接
+  🔗 [3.1] 并发测试 1
+  🔗 [3.2] 并发测试 2
+  🔗 [3.3] 并发测试 3
+  🔗 [3.4] 并发测试 4
+  🔗 [3.5] 并发测试 5
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+  📊 第四轮：压力测试
+  🔗 [4.1] 压力测试 1
+  🔗 [4.2] 压力测试 2
+  🔗 [4.3] 压力测试 3
+  🔗 [4.4] 压力测试 4
+  🔗 [4.5] 压力测试 5
+  🔗 [4.6] 压力测试 6
+  🔗 [4.7] 压力测试 7
+  🔗 [4.8] 压力测试 8
+  🔗 [4.9] 压力测试 9
+  🔗 [4.10] 压力测试 10
+    ✅ 成功 (Duration: 20 ms)
+    ✅ 成功 (Duration: 0 ms)
+    ✅ 成功 (Duration: 0 ms)
+    ✅ 成功 (Duration: 0 ms)
+    ✅ 成功 (Duration: 0 ms)
+    ✅ 成功 (Duration: 0 ms)
+    ✅ 成功 (Duration: 0 ms)
+    ✅ 成功 (Duration: 0 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+  ✅ 无锁版本 测试完成
+
+🛑 停止服务...
+./test_lockfree_performance.sh: line 58: 66033 Terminated: 15          RUST_LOG=warn $binaries_path/anytls-server --listen 0.0.0.0:8443 --password "test123" --max-outbound-connections 50 --max-idle-time-secs 60 --min-idle-connections 3 --pool-type "$pool_type"
+./test_lockfree_performance.sh: line 58: 66035 Terminated: 15          RUST_LOG=warn $binaries_path/anytls-client-optimized --listen 127.0.0.1:1080 --server 127.0.0.1:8443 --password "test123"
+----------------------------------------
+
+🚀 测试高性能版本
+🔧 测试 高性能版本 (类型: highperf)
+----------------------------------------
+✅ Server 已启动 (PID: 66227, 类型: highperf)
+✅ Client 已启动 (PID: 66229)
+🚀 开始性能测试...
+  📊 第一轮：建立新连接
+  🔗 [1.1] HTTPBin GET
+    ✅ 成功 (Duration: 0 ms)
+  🔗 [1.2] HTTPBin IP
+    ✅ 成功 (Duration: 10 ms)
+  🔗 [1.3] HTTPBin User-Agent
+    ✅ 成功 (Duration: 0 ms)
+  📊 第二轮：连接重用
+  🔗 [2.1] HTTPBin GET
+    ✅ 成功 (Duration: 10 ms)
+  🔗 [2.2] HTTPBin IP
+    ✅ 成功 (Duration: 0 ms)
+  🔗 [2.3] HTTPBin User-Agent
+    ✅ 成功 (Duration: 10 ms)
+  📊 第三轮：并发连接
+  🔗 [3.1] 并发测试 1
+  🔗 [3.2] 并发测试 2
+  🔗 [3.3] 并发测试 3
+  🔗 [3.4] 并发测试 4
+  🔗 [3.5] 并发测试 5
+    ✅ 成功 (Duration: 20 ms)
+    ✅ 成功 (Duration: 20 ms)
+    ✅ 成功 (Duration: 20 ms)
+    ✅ 成功 (Duration: 20 ms)
+    ✅ 成功 (Duration: 20 ms)
+  📊 第四轮：压力测试
+  🔗 [4.1] 压力测试 1
+  🔗 [4.2] 压力测试 2
+  🔗 [4.3] 压力测试 3
+  🔗 [4.4] 压力测试 4
+  🔗 [4.5] 压力测试 5
+  🔗 [4.6] 压力测试 6
+  🔗 [4.7] 压力测试 7
+  🔗 [4.8] 压力测试 8
+  🔗 [4.9] 压力测试 9
+  🔗 [4.10] 压力测试 10
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+    ✅ 成功 (Duration: 10 ms)
+  ✅ 高性能版本 测试完成
+
+🛑 停止服务...
+./test_lockfree_performance.sh: line 58: 66227 Terminated: 15          RUST_LOG=warn $binaries_path/anytls-server --listen 0.0.0.0:8443 --password "test123" --max-outbound-connections 50 --max-idle-time-secs 60 --min-idle-connections 3 --pool-type "$pool_type"
+./test_lockfree_performance.sh: line 58: 66229 Terminated: 15          RUST_LOG=warn $binaries_path/anytls-client-optimized --listen 127.0.0.1:1080 --server 127.0.0.1:8443 --password "test123"
+----------------------------------------
+
+📊 测试完成！
+
+💡 观察要点：
+  - 连接建立时间：第一轮测试
+  - 连接重用效果：第二轮测试
+  - 并发处理能力：第三轮测试
+  - 压力测试表现：第四轮测试
+
+📈 性能提升预期：
+  - 无锁版本：减少锁竞争，提升并发性能
+  - 高性能版本：进一步优化，减少内存分配
+
+🔍 查看 Server 日志中的连接池统计信息来验证效果
+➜  tests git:(main) ✗
