@@ -20,7 +20,7 @@ echo "  - 最大空闲时间: 60秒"
 echo "  - 最小空闲连接: 3"
 echo
 
-binaries_path="/Users/Abel/Apps/libs/rust/target/release"
+binaries_path="./target/release"
 
 # 启动 server
 RUST_LOG=info $binaries_path/anytls-server \

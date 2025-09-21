@@ -10,7 +10,7 @@ echo
 echo "📦 编译项目..."
 cargo build --release --bin anytls-server --bin anytls-client-optimized
 
-binaries_path="/Users/Abel/Apps/libs/rust/target/release"
+binaries_path="./target/release"
 
 echo
 echo "🧪 开始性能对比测试..."
