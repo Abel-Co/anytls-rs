@@ -8,7 +8,8 @@ use crate::util::{string_map::{StringMap, StringMapExt}, PROGRAM_VERSION_NAME};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::sync::Mutex;
+use glommio::sync::RwLock;
 
 pub struct Session {
     streams: Arc<Mutex<HashMap<u32, Arc<Stream>>>>,
@@ -74,14 +75,14 @@ impl Session {
         settings.insert("v".to_string(), "2".to_string());
         settings.insert("client".to_string(), PROGRAM_VERSION_NAME.to_string());
         
-        let padding = self.padding.read().await;
+        let padding = self.padding.read().await?;
         settings.insert("padding-md5".to_string(), padding.md5().to_string());
         drop(padding);
         
         let frame = Frame::with_data(CMD_SETTINGS, 0, settings.to_bytes().into());
         self.write_frame(frame).await?;
         
-        let mut buffering = self.buffering.lock().await;
+        let mut buffering = self.buffering.lock().unwrap();
         *buffering = true;
         
         Ok(())
@@ -89,12 +90,12 @@ impl Session {
     
     async fn recv_loop(&self) -> io::Result<()> {
         loop {
-            if *self.closed.lock().await {
+            if *self.closed.lock().unwrap() {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed"));
             }
             
             // Simplified implementation - in a real implementation, this would read from the connection
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            glommio::timer::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
     
@@ -102,7 +103,7 @@ impl Session {
         match cmd {
             CMD_PSH => {
                 if !data.is_empty() {
-                    let streams = self.streams.lock().await;
+                    let streams = self.streams.lock().unwrap();
                     if let Some(_stream) = streams.get(&sid) {
                         // Write data to stream
                         // This would need proper implementation
@@ -111,7 +112,7 @@ impl Session {
             }
             CMD_SYN => {
                 if !self.is_client {
-                    let mut streams = self.streams.lock().await;
+                    let mut streams = self.streams.lock().unwrap();
                     if !streams.contains_key(&sid) {
                         let stream = Arc::new(Stream::new(sid));
                         streams.insert(sid, stream);
@@ -119,7 +120,7 @@ impl Session {
                 }
             }
             CMD_FIN => {
-                let mut streams = self.streams.lock().await;
+                let mut streams = self.streams.lock().unwrap();
                 if let Some(stream) = streams.remove(&sid) {
                     stream.close().await?;
                 }
@@ -182,7 +183,7 @@ impl Session {
     }
     
     pub async fn open_stream(&self) -> io::Result<Arc<Stream>> {
-        let mut stream_id = self.stream_id.lock().await;
+        let mut stream_id = self.stream_id.lock().unwrap();
         *stream_id += 1;
         let id = *stream_id;
         drop(stream_id);
@@ -192,7 +193,7 @@ impl Session {
         let frame = Frame::new(CMD_SYN, id);
         self.write_frame(frame).await?;
         
-        let mut streams = self.streams.lock().await;
+        let mut streams = self.streams.lock().unwrap();
         streams.insert(id, stream.clone());
         
         Ok(stream)
@@ -202,21 +203,21 @@ impl Session {
         let frame = Frame::new(CMD_FIN, sid);
         self.write_frame(frame).await?;
         
-        let mut streams = self.streams.lock().await;
+        let mut streams = self.streams.lock().unwrap();
         streams.remove(&sid);
         
         Ok(())
     }
     
     pub async fn close(&self) -> io::Result<()> {
-        let mut closed = self.closed.lock().await;
+        let mut closed = self.closed.lock().unwrap();
         if *closed {
             return Ok(());
         }
         *closed = true;
         drop(closed);
         
-        let streams = self.streams.lock().await;
+        let streams = self.streams.lock().unwrap();
         for stream in streams.values() {
             let _ = stream.close().await;
         }
@@ -225,11 +226,11 @@ impl Session {
     }
     
     pub async fn is_closed(&self) -> bool {
-        *self.closed.lock().await
+        *self.closed.lock().unwrap()
     }
     
     pub async fn peer_version(&self) -> u8 {
-        *self.peer_version.lock().await
+        *self.peer_version.lock().unwrap()
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::util::string_map::{StringMap, StringMapExt};
 use rand::Rng;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use glommio::sync::RwLock;
 
 pub const CHECK_MARK: i32 = -1;
 

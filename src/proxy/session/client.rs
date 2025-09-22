@@ -4,8 +4,9 @@ use crate::util::r#type::DialOutFunc;
 use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
-use tokio::time::interval;
+use std::sync::Mutex;
+use glommio::sync::RwLock;
+use glommio::timer::Timer;
 
 pub struct Client {
     dial_out: DialOutFunc,
@@ -40,13 +41,12 @@ impl Client {
         let idle_timeout = client.idle_session_timeout;
         let min_idle = client.min_idle_sessions;
         
-        tokio::spawn(async move {
-            let mut interval = interval(idle_session_check_interval);
+        glommio::spawn_local(async move {
             loop {
-                interval.tick().await;
+                Timer::new(idle_session_check_interval).await;
                 Self::idle_cleanup(&idle_sessions, idle_timeout, min_idle).await;
             }
-        });
+        }).detach();
         
         client
     }
@@ -67,7 +67,7 @@ impl Client {
     }
     
     async fn find_idle_session(&self) -> Option<Arc<Session>> {
-        let mut idle_sessions = self.idle_sessions.lock().await;
+        let mut idle_sessions = self.idle_sessions.lock().unwrap();
         if let Some((_, session, _)) = idle_sessions.pop() {
             Some(session)
         } else {
@@ -79,27 +79,27 @@ impl Client {
         let conn = (self.dial_out)().await?;
         let session = Arc::new(Session::new_client(conn, self.padding.clone()));
         
-        let mut counter = self.session_counter.lock().await;
+        let mut counter = self.session_counter.lock().unwrap();
         *counter += 1;
         let seq = *counter;
         drop(counter);
         
-        let mut sessions = self.sessions.lock().await;
+        let mut sessions = self.sessions.lock().unwrap();
         sessions.insert(seq, session.clone());
         
         // Start the session
         let session_clone = session.clone();
         let idle_sessions_clone = self.idle_sessions.clone();
         
-        tokio::spawn(async move {
+        glommio::spawn_local(async move {
             if let Err(e) = session_clone.run().await {
                 log::error!("Session error: {}", e);
             }
             
             // Move to idle sessions when done
-            let mut idle_sessions = idle_sessions_clone.lock().await;
+            let mut idle_sessions = idle_sessions_clone.lock().unwrap();
             idle_sessions.push((seq, session_clone, Instant::now()));
-        });
+        }).detach();
         
         Ok(session)
     }
@@ -109,7 +109,7 @@ impl Client {
         timeout: Duration,
         min_idle: usize,
     ) {
-        let mut sessions = idle_sessions.lock().await;
+        let mut sessions = idle_sessions.lock().unwrap();
         let now = Instant::now();
         let mut active_count = 0;
         let mut to_remove = Vec::new();
@@ -138,7 +138,7 @@ impl Client {
     }
     
     pub async fn close(&self) -> Result<(), std::io::Error> {
-        let sessions = self.sessions.lock().await;
+        let sessions = self.sessions.lock().unwrap();
         for session in sessions.values() {
             let _ = session.close().await;
         }

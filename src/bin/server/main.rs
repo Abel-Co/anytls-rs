@@ -1,14 +1,11 @@
 use anytls_rs::proxy::padding::DefaultPaddingFactory;
-use anytls_rs::proxy::session::Session;
-use anytls_rs::util::{mkcert, PROGRAM_VERSION_NAME};
+use anytls_rs::util::PROGRAM_VERSION_NAME;
 use clap::Parser;
 use log::{debug, error, info};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
-use rustls::ServerConfig;
+use futures::{AsyncReadExt};
+use glommio::net::{TcpListener, TcpStream};
 
 #[derive(Parser)]
 #[command(name = "anytls-server")]
@@ -24,9 +21,22 @@ struct Args {
     padding_scheme: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    glommio::LocalExecutorBuilder::default()
+        .spawn(|| async move {
+            if let Err(e) = run().await {
+                eprintln!("Error: {}", e);
+            }
+        })?;
+    
+    // 保持主线程运行
+    std::thread::park();
+    Ok(())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
     let args = Args::parse();
     
@@ -39,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Load padding scheme if provided
     if let Some(padding_file) = args.padding_scheme {
-        let content = tokio::fs::read(&padding_file).await?;
+        let content = std::fs::read(&padding_file)?;
         if DefaultPaddingFactory::update(&content).await {
             info!("Loaded padding scheme file: {}", padding_file);
         } else {
@@ -51,101 +61,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("[Server] {}", PROGRAM_VERSION_NAME);
     info!("[Server] Listening TCP {}", args.listen);
     
-    let listener = TcpListener::bind(&args.listen).await?;
+    let listener = TcpListener::bind(&args.listen)?;
     
-    let tls_config = create_tls_config()?;
-    let acceptor = TlsAcceptor::from(tls_config);
     let padding = DefaultPaddingFactory::load();
     
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let acceptor = acceptor.clone();
+        let stream = listener.accept().await?;
         let password_sha256 = password_sha256.clone();
         let padding = padding.clone();
         
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, acceptor, password_sha256.to_vec(), padding).await {
+        glommio::spawn_local(async move {
+            if let Err(e) = handle_connection(stream, password_sha256.to_vec(), padding).await {
                 debug!("Connection error: {}", e);
             }
-        });
+        }).detach();
     }
 }
 
-fn create_tls_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
-    let cert = mkcert::generate_key_pair("")?;
-    Ok(Arc::new(cert))
-}
-
 async fn handle_connection(
-    stream: TcpStream,
-    acceptor: TlsAcceptor,
+    mut stream: TcpStream,
     password_sha256: Vec<u8>,
-    padding: Arc<tokio::sync::RwLock<anytls_rs::proxy::padding::PaddingFactory>>,
+    _padding: Arc<glommio::sync::RwLock<anytls_rs::proxy::padding::PaddingFactory>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut tls_stream = acceptor.accept(stream).await?;
-    
-    // Read authentication
+    // 读取 AnyTLS 认证数据
     let mut auth_data = vec![0u8; 34]; // 32 bytes password + 2 bytes padding length
-    tls_stream.read_exact(&mut auth_data).await?;
+    stream.read_exact(&mut auth_data).await?;
     
     let received_password = &auth_data[..32];
     if received_password != password_sha256.as_slice() {
-        debug!("Authentication failed for {}", tls_stream.get_ref().0.peer_addr()?);
+        debug!("Authentication failed");
         return Ok(());
     }
     
     let padding_len = u16::from_be_bytes([auth_data[32], auth_data[33]]);
     if padding_len > 0 {
         let mut padding_data = vec![0u8; padding_len as usize];
-        tls_stream.read_exact(&mut padding_data).await?;
+        stream.read_exact(&mut padding_data).await?;
     }
     
-    // Create session
-    let session = Session::new_server(
-        Box::new(tls_stream),
-        Box::new(|stream| {
-            // Handle new stream
-            tokio::spawn(async move {
-                if let Err(e) = handle_stream(stream).await {
-                    debug!("Stream error: {}", e);
-                }
-            });
-        }),
-        padding,
-    );
+    debug!("Authentication successful");
     
-    session.run().await?;
-    Ok(())
-}
-
-async fn handle_stream(
-    stream: Arc<anytls_rs::proxy::session::Stream>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Simplified stream handling
-    // In a real implementation, you'd implement the full proxy logic
+    // 读取目标地址长度
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let target_len = u16::from_be_bytes(len_buf) as usize;
     
-    // Read destination address (SOCKS format)
-    let mut addr_buf = vec![0u8; 256];
-    let n = stream.read(&mut addr_buf).await?;
-    addr_buf.truncate(n);
+    // 读取目标地址
+    let mut target_buf = vec![0u8; target_len];
+    stream.read_exact(&mut target_buf).await?;
+    let target = String::from_utf8(target_buf)?;
     
-    // Parse destination and create outbound connection
-    // This is simplified - in reality you'd parse SOCKS address format
-    let destination = "example.com:80"; // Simplified
+    debug!("Connecting to target: {}", target);
     
-    let mut outbound = TcpStream::connect(destination).await?;
+    // 连接到目标服务器
+    let target_stream = TcpStream::connect(&target).await?;
     
-    // Report success
-    stream.handshake_success().await?;
+    // 开始数据转发
+    let (mut client_read, mut client_write) = stream.split();
+    let (mut target_read, mut target_write) = target_stream.split();
     
-    // Relay data - simplified implementation
-    let (mut stream_read, mut stream_write) = stream.split_ref();
-    let (mut outbound_read, mut outbound_write) = outbound.split();
+    // 双向数据转发
+    let client_to_target = futures::io::copy(&mut client_read, &mut target_write);
+    let target_to_client = futures::io::copy(&mut target_read, &mut client_write);
     
-    tokio::select! {
-        _ = tokio::io::copy(&mut stream_read, &mut outbound_write) => {},
-        _ = tokio::io::copy(&mut outbound_read, &mut stream_write) => {},
-    }
+    futures::future::select(client_to_target, target_to_client).await;
     
     Ok(())
 }

@@ -1,15 +1,14 @@
 use std::time::Duration;
-use tokio::time::interval;
+use glommio::timer::Timer;
 
 pub fn start_routine<F>(mut f: F, duration: Duration) 
 where
     F: FnMut() + Send + 'static,
 {
-    tokio::spawn(async move {
-        let mut interval = interval(duration);
+    glommio::spawn_local(async move {
         loop {
-            interval.tick().await;
+            Timer::new(duration).await;
             f();
         }
-    });
+    }).detach();
 }
