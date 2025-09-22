@@ -15,7 +15,7 @@ echo "Waiting for client to start..."
 sleep 2
 
 echo "Testing SOCKS5 proxy with curl..."
-curl -x socks5h://127.0.0.1:1080 -I https://www.jd.com/ --connect-timeout 10
+curl -w "time_total:  %{time_total}\n" -x socks5h://127.0.0.1:1080 -I https://www.jd.com/ --connect-timeout 10
 
 echo "Cleaning up..."
 kill $CLIENT_PID 2>/dev/null

@@ -18,8 +18,8 @@ name = "anytls-server"
 path = "src/bin/server/main.rs"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-tokio-rustls = "0.25"
+glommio = "0.8"
+tokio = { version = "1.0", features = ["io-util"] }
 rustls = "0.22"
 rustls-pemfile = "2.0"
 rcgen = "0.13"

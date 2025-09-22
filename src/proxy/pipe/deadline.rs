@@ -1,35 +1,39 @@
 use std::sync::Arc;
-use tokio::sync::Notify;
-use tokio::time::sleep;
+use std::sync::{Condvar, Mutex};
+use glommio::timer::sleep;
 
 pub struct PipeDeadline {
-    notify: Arc<Notify>,
-    timer: Option<tokio::task::JoinHandle<()>>,
+    notify: Arc<(Mutex<bool>, Condvar)>,
+    timer: Option<glommio::task::JoinHandle<()>>,
 }
 
 impl PipeDeadline {
     pub fn new() -> Self {
         Self {
-            notify: Arc::new(Notify::new()),
+            notify: Arc::new((Mutex::new(false), Condvar::new())),
             timer: None,
         }
     }
     
     pub fn set(&mut self, deadline: std::time::SystemTime) {
         if let Some(timer) = self.timer.take() {
-            timer.abort();
+            // glommio JoinHandle doesn't have abort, just drop it
+            drop(timer);
         }
         
         if let Ok(duration) = deadline.duration_since(std::time::SystemTime::UNIX_EPOCH) {
             let notify = self.notify.clone();
-            self.timer = Some(tokio::spawn(async move {
+            self.timer = Some(glommio::spawn_local(async move {
                 sleep(duration).await;
-                notify.notify_one();
-            }));
+                let (lock, cvar) = &*notify;
+                let mut notified = lock.lock().unwrap();
+                *notified = true;
+                cvar.notify_one();
+            }).detach());
         }
     }
     
-    pub fn wait(&self) -> &Notify {
+    pub fn wait(&self) -> &(Mutex<bool>, Condvar) {
         &self.notify
     }
 }

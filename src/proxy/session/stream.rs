@@ -7,8 +7,8 @@ pub struct Stream {
     id: u32,
     pipe_reader: PipeReader,
     pipe_writer: PipeWriter,
-    closed: Arc<tokio::sync::Mutex<bool>>,
-    reported: Arc<tokio::sync::Mutex<bool>>,
+    closed: Arc<std::sync::Mutex<bool>>,
+    reported: Arc<std::sync::Mutex<bool>>,
 }
 
 impl Stream {
@@ -19,8 +19,8 @@ impl Stream {
             id,
             pipe_reader,
             pipe_writer,
-            closed: Arc::new(tokio::sync::Mutex::new(false)),
-            reported: Arc::new(tokio::sync::Mutex::new(false)),
+            closed: Arc::new(std::sync::Mutex::new(false)),
+            reported: Arc::new(std::sync::Mutex::new(false)),
         }
     }
     
@@ -38,7 +38,7 @@ impl Stream {
     }
     
     pub async fn close_with_error(&self, error: Option<io::Error>) -> io::Result<()> {
-        let mut closed = self.closed.lock().await;
+        let mut closed = self.closed.lock().unwrap();
         if *closed {
             return Ok(());
         }
@@ -51,7 +51,7 @@ impl Stream {
     }
     
     pub async fn handshake_failure(&self, _err: &str) -> io::Result<()> {
-        let mut reported = self.reported.lock().await;
+        let mut reported = self.reported.lock().unwrap();
         if *reported {
             return Ok(());
         }
@@ -63,7 +63,7 @@ impl Stream {
     }
     
     pub async fn handshake_success(&self) -> io::Result<()> {
-        let mut reported = self.reported.lock().await;
+        let mut reported = self.reported.lock().unwrap();
         if *reported {
             return Ok(());
         }

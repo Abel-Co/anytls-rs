@@ -1,7 +1,7 @@
 use crate::proxy::pipe::PipeDeadline;
 use std::io;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex};
 
 pub struct PipeReader {
     pub inner: Arc<Mutex<PipeInner>>,
@@ -17,20 +17,20 @@ pub struct PipeInner {
     closed: bool,
     read_error: Option<io::Error>,
     write_error: Option<io::Error>,
-    data_channel: mpsc::UnboundedSender<Vec<u8>>,
-    data_receiver: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    data_channel: mpsc::Sender<Vec<u8>>,
+    data_receiver: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
 impl PipeReader {
     pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().unwrap();
         
         if inner.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Pipe closed"));
         }
         
         if let Some(ref mut receiver) = inner.data_receiver {
-            if let Some(data) = receiver.recv().await {
+            if let Ok(data) = receiver.recv() {
                 let len = data.len().min(buf.len());
                 buf[..len].copy_from_slice(&data[..len]);
                 Ok(len)
@@ -44,15 +44,15 @@ impl PipeReader {
     
     pub fn close_with_error(&self, error: Option<io::Error>) {
         let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let mut inner = inner.lock().await;
+        glommio::spawn_local(async move {
+            let mut inner = inner.lock().unwrap();
             inner.read_error = error;
             inner.closed = true;
-        });
+        }).detach();
     }
     
     pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().unwrap();
         inner.read_deadline.set(deadline);
         Ok(())
     }
@@ -60,7 +60,7 @@ impl PipeReader {
 
 impl PipeWriter {
     pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let inner = self.inner.lock().await;
+        let inner = self.inner.lock().unwrap();
         
         if inner.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Pipe closed"));
@@ -75,22 +75,22 @@ impl PipeWriter {
     
     pub fn close_with_error(&self, error: Option<io::Error>) {
         let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let mut inner = inner.lock().await;
+        glommio::spawn_local(async move {
+            let mut inner = inner.lock().unwrap();
             inner.write_error = error;
             inner.closed = true;
-        });
+        }).detach();
     }
     
     pub async fn set_write_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().unwrap();
         inner.write_deadline.set(deadline);
         Ok(())
     }
 }
 
 pub fn pipe() -> (PipeReader, PipeWriter) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel();
     
     let inner = Arc::new(Mutex::new(PipeInner {
         read_deadline: PipeDeadline::new(),
