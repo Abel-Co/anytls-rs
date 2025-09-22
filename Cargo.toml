@@ -17,9 +17,9 @@ path = "src/bin/client/main.rs"
 name = "anytls-client-optimized"
 path = "src/bin/client_optimized.rs"
 
-# [[bin]]
-# name = "anytls-server"
-# path = "src/bin/server/main.rs"
+[[bin]]
+name = "anytls-server"
+path = "src/bin/server/main.rs"
 
 [dependencies]
 # 基础异步运行时
