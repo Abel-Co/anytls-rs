@@ -36,13 +36,16 @@ cargo run --bin anytls-client -- -l 0.0.0.0:1080 -s server_ip:port -p password
 ### 版本/分支
 
 - main
-time_total:  0.029762
+  - anytls-go 的直接转译；
+  - time_total:  0.029762
 
 - highperf
-time_total:  0.025750
+  - 连接复用、池化
+  - time_total:  0.025750
 
 - Glommio
-time_total:  0.024587
+  - glommio运行时，减少跨线程唤醒和全局队列竞争；
+  - time_total:  0.024587
 
 
 ### sing-box
