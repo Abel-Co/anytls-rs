@@ -17,7 +17,6 @@ A Rust implementation of the AnyTLS proxy protocol that attempts to mitigate the
 ### Server
 
 ```shell
-# ./anytls-server -l 0.0.0.0:8443 -p password
 cargo run --bin anytls-server -- -l 0.0.0.0:8443 -p password
 # cargo run --bin anytls-server --release -- -l 0.0.0.0:8443 -p password
 ```
@@ -27,12 +26,24 @@ cargo run --bin anytls-server -- -l 0.0.0.0:8443 -p password
 ### Client
 
 ```shell
-# ./anytls-client -l 127.0.0.1:1080 -s server_ip:port -p password
-cargo run --bin anytls-client -- -l 127.0.0.1:1080 -s server_ip:port -p password
-# cargo run --bin anytls-client --release -- -l 127.0.0.1:1080 -s 127.0.0.1:8443 -p password
+cargo run --bin anytls-client -- -l 0.0.0.0:1080 -s server_ip:port -p password
+# cargo run --bin anytls-client --release -- -l 0.0.0.0:1080 -s 127.0.0.1:8443 -p password
 ```
 
 `127.0.0.1:1080` is the local SOCKS5 proxy listening address, theoretically supports TCP and UDP (via UDP over TCP transmission).
+
+
+### 版本/分支
+
+- main
+time_total:  0.029762
+
+- highperf
+time_total:  0.025750
+
+- Glommio
+time_total:  0.024587
+
 
 ### sing-box
 
