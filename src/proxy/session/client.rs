@@ -87,18 +87,18 @@ impl Client {
         let mut sessions = self.sessions.lock().await;
         sessions.insert(seq, session.clone());
         
-        // Start the session
-        let session_clone = session.clone();
-        let idle_sessions_clone = self.idle_sessions.clone();
+        // 立即发送设置，符合AnyTLS协议要求
+        if let Err(e) = session.send_settings().await {
+            log::error!("Failed to send settings: {}", e);
+            return Err(e);
+        }
         
+        // 启动Session的接收循环
+        let session_clone = session.clone();
         tokio::spawn(async move {
-            if let Err(e) = session_clone.run().await {
-                log::error!("Session error: {}", e);
+            if let Err(e) = session_clone.recv_loop().await {
+                log::error!("Session recv_loop error: {}", e);
             }
-            
-            // Move to idle sessions when done
-            let mut idle_sessions = idle_sessions_clone.lock().await;
-            idle_sessions.push((seq, session_clone, Instant::now()));
         });
         
         Ok(session)

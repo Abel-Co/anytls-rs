@@ -29,8 +29,8 @@ impl Stream {
     }
     
     pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        // Simplified implementation
-        Ok(buf.len())
+        // 将数据写入 pipe writer，这样读取端就能收到数据
+        self.pipe_writer.write(buf).await
     }
     
     pub async fn close(&self) -> io::Result<()> {

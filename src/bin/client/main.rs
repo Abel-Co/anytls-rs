@@ -29,7 +29,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
     let args = Args::parse();
     
@@ -249,34 +249,43 @@ async fn handle_connection(
     log::info!("Connecting to target: {}", target);
     
     // 创建到代理服务器的连接
-    let _proxy_stream = client.create_stream().await?;
+    let proxy_stream = client.create_stream().await?;
+    
+    // 发送目标地址到代理服务器
+    let mut addr_data = Vec::new();
+    addr_data.push(atyp); // 地址类型
+    match atyp {
+        1 => { // IPv4
+            addr_data.extend_from_slice(&buffer[4..8]); // IP地址
+            addr_data.extend_from_slice(&buffer[8..10]); // 端口
+        }
+        3 => { // 域名
+            let domain_len = buffer[4] as usize;
+            addr_data.push(domain_len as u8);
+            addr_data.extend_from_slice(&buffer[5..5 + domain_len]);
+            addr_data.extend_from_slice(&buffer[5 + domain_len..5 + domain_len + 2]);
+        }
+        _ => return Err("Unsupported address type".into()),
+    }
+    
+    // 发送地址数据到代理服务器
+    proxy_stream.write(&addr_data).await?;
     
     // 发送连接成功响应
     let response = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]; // 成功响应
     stream.write_all(&response).await?;
     
-    // 建立到目标服务器的连接
-    let mut target_stream = match TcpStream::connect(&target).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            // 发送连接失败响应
-            let response = [5, 1, 0, 1, 0, 0, 0, 0, 0, 0]; // 连接失败
-            let _ = stream.write_all(&response).await;
-            return Err(e.into());
-        }
-    };
-    
-    // 开始数据转发
+    // 开始数据转发：客户端 <-> 代理服务器
     let (mut client_read, mut client_write) = stream.split();
-    let (mut target_read, mut target_write) = target_stream.split();
+    let (mut proxy_read, mut proxy_write) = proxy_stream.split_ref();
     
     // 双向数据转发
     tokio::select! {
-        _ = tokio::io::copy(&mut client_read, &mut target_write) => {
-            log::debug!("Client to target stream ended");
+        _ = tokio::io::copy(&mut client_read, &mut proxy_write) => {
+            log::debug!("Client to proxy stream ended");
         }
-        _ = tokio::io::copy(&mut target_read, &mut client_write) => {
-            log::debug!("Target to client stream ended");
+        _ = tokio::io::copy(&mut proxy_read, &mut client_write) => {
+            log::debug!("Proxy to client stream ended");
         }
     }
     
