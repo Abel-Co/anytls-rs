@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
-use rustls::ServerConfig;
 
 #[derive(Parser)]
 #[command(name = "anytls-server")]
@@ -51,28 +50,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("[Server] Listening TCP {}", args.listen);
     
     let listener = TcpListener::bind(&args.listen).await?;
-    
-    let tls_config = create_tls_config()?;
-    let acceptor = TlsAcceptor::from(tls_config);
+
+    let tls_config = Arc::new(mkcert::generate_key_pair("")?);
+    let tls_acceptor = TlsAcceptor::from(tls_config);
     let padding = DefaultPaddingFactory::load();
     
     loop {
         let (stream, _addr) = listener.accept().await?;
-        let acceptor = acceptor.clone();
+        let tls_acceptor = tls_acceptor.clone();
         let password_sha256 = password_sha256.clone();
         let padding = padding.clone();
         
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, acceptor, password_sha256.to_vec(), padding).await {
+            if let Err(e) = handle_connection(stream, tls_acceptor, password_sha256.to_vec(), padding).await {
                 debug!("Connection error: {}", e);
             }
         });
     }
-}
-
-fn create_tls_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
-    let cert = mkcert::generate_key_pair("")?;
-    Ok(Arc::new(cert))
 }
 
 async fn handle_connection(
