@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     0
                 };
+                drop(padding_factory);
                 
                 auth_data.extend_from_slice(&padding_len.to_be_bytes());
                 if padding_len > 0 {
@@ -81,7 +82,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Send auth data
                 tls_stream.write_all(&auth_data).await?;
                 
-                Ok(Box::new(tls_stream) as Box<dyn anytls_rs::util::r#type::AsyncReadWrite>)
+                // 立即创建Session并发送cmdSettings
+                let session = anytls_rs::proxy::session::Session::new_client(
+                    Box::new(tls_stream),
+                    padding,
+                );
+                
+                // 立即发送cmdSettings
+                if let Err(e) = session.send_settings().await {
+                    log::error!("Failed to send settings: {}", e);
+                    return Err(e);
+                }
+                
+                // 启动Session的接收循环
+                let session_clone = session.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = session_clone.recv_loop().await {
+                        log::error!("Session recv_loop error: {}", e);
+                    }
+                });
+                
+                Ok(Arc::new(session))
             }))
         }),
         padding,

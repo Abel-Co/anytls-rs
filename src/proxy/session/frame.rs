@@ -1,16 +1,18 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-pub const CMD_WASTE: u8 = 0;
-pub const CMD_SYN: u8 = 1;
-pub const CMD_PSH: u8 = 2;
-pub const CMD_FIN: u8 = 3;
-pub const CMD_SETTINGS: u8 = 4;
-pub const CMD_ALERT: u8 = 5;
-pub const CMD_UPDATE_PADDING_SCHEME: u8 = 6;
-pub const CMD_SYNACK: u8 = 7;
-pub const CMD_HEART_REQUEST: u8 = 8;
-pub const CMD_HEART_RESPONSE: u8 = 9;
-pub const CMD_SERVER_SETTINGS: u8 = 10;
+// Command constants matching Go implementation
+pub const CMD_WASTE: u8 = 0; // Paddings
+pub const CMD_SYN: u8 = 1; // stream open
+pub const CMD_PSH: u8 = 2; // data push
+pub const CMD_FIN: u8 = 3; // stream close, a.k.a EOF mark
+pub const CMD_SETTINGS: u8 = 4; // Settings (Client send to Server)
+pub const CMD_ALERT: u8 = 5; // Alert
+pub const CMD_UPDATE_PADDING_SCHEME: u8 = 6; // update padding scheme
+// Since version 2
+pub const CMD_SYNACK: u8 = 7; // Server reports to the client that the stream has been opened
+pub const CMD_HEART_REQUEST: u8 = 8; // Keep alive command
+pub const CMD_HEART_RESPONSE: u8 = 9; // Keep alive command
+pub const CMD_SERVER_SETTINGS: u8 = 10; // Settings (Server send to client)
 
 pub const HEADER_OVERHEAD_SIZE: usize = 1 + 4 + 2;
 

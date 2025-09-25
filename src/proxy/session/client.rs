@@ -76,8 +76,9 @@ impl Client {
     }
     
     async fn create_session(&self) -> Result<Arc<Session>, std::io::Error> {
-        let conn = (self.dial_out)().await?;
-        let session = Arc::new(Session::new_client(conn, self.padding.clone()));
+        log::debug!("Creating new session...");
+        // dial_out now returns a Session directly
+        let session = (self.dial_out)().await?;
         
         let mut counter = self.session_counter.lock().await;
         *counter += 1;
@@ -86,21 +87,9 @@ impl Client {
         
         let mut sessions = self.sessions.lock().await;
         sessions.insert(seq, session.clone());
+        drop(sessions);
         
-        // 立即发送设置，符合AnyTLS协议要求
-        if let Err(e) = session.send_settings().await {
-            log::error!("Failed to send settings: {}", e);
-            return Err(e);
-        }
-        
-        // 启动Session的接收循环
-        let session_clone = session.clone();
-        tokio::spawn(async move {
-            if let Err(e) = session_clone.recv_loop().await {
-                log::error!("Session recv_loop error: {}", e);
-            }
-        });
-        
+        log::debug!("Session created and registered");
         Ok(session)
     }
     
