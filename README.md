@@ -38,6 +38,8 @@ cargo run --bin anytls-client -- -l 0.0.0.0:1080 -s server_ip:port -p password
 - main
   - anytls-go 的直接转译；
   - time_total:  0.029762
+  - Success: client(rs) <=> server(go)
+  - Failure: client(go) <=> server(rs)
 
 - highperf
   - 连接复用、池化
