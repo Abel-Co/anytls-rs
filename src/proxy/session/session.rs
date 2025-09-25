@@ -71,10 +71,12 @@ impl Session {
     
     pub async fn run(&self) -> io::Result<()> {
         if self.is_client {
-            self.send_settings().await?;
+            // Client settings are sent in create_session, just run recv_loop
+            self.recv_loop().await
+        } else {
+            // Server runs recv_loop directly
+            self.recv_loop().await
         }
-        
-        self.recv_loop().await
     }
     
     pub async fn send_settings(&self) -> io::Result<()> {
@@ -140,9 +142,11 @@ impl Session {
                         }
                     }
                 }
-                CMD_SYN => {
+                CMD_SYN => { // should be server only
+                    log::debug!("Received CMD_SYN from client, received_settings_from_client: {}", received_settings_from_client);
                     if !self.is_client && !received_settings_from_client {
                         // 客户端没有发送设置，发送警告
+                        log::warn!("Client did not send its settings, sending alert");
                         let frame = Frame::with_data(CMD_ALERT, 0, "client did not send its settings".as_bytes().to_vec().into());
                         self.write_frame(frame).await?;
                         return Ok(());
@@ -155,12 +159,15 @@ impl Session {
                         drop(streams);
                         
                         // 调用新流回调
-                        if let Some(callback) = &self.on_new_stream {
-                            callback(stream);
+                        if let Some(callback) = self.on_new_stream.clone() {
+                            let stream_clone = stream.clone();
+                            tokio::spawn(async move {
+                                callback(stream_clone);
+                            });
                         }
                     }
                 }
-                CMD_SYNACK => {
+                CMD_SYNACK => { // should be client only
                     if length > 0 {
                         let mut data = vec![0u8; length];
                         {
@@ -177,10 +184,12 @@ impl Session {
                     }
                 }
                 CMD_FIN => {
-                    let mut streams = self.streams.lock().await;
-                    if let Some(stream) = streams.remove(&sid) {
+                    let streams = self.streams.lock().await;
+                    if let Some(stream) = streams.get(&sid) {
                         let _ = stream.close().await;
                     }
+                    let mut streams = self.streams.lock().await;
+                    streams.remove(&sid);
                 }
                 CMD_WASTE => {
                     if length > 0 {
@@ -193,6 +202,7 @@ impl Session {
                     }
                 }
                 CMD_SETTINGS => {
+                    log::debug!("Received CMD_SETTINGS, length: {}", length);
                     if length > 0 {
                         let mut data = vec![0u8; length];
                         {
@@ -201,6 +211,7 @@ impl Session {
                         }
                         
                         if !self.is_client {
+                            log::debug!("Server received settings from client");
                             received_settings_from_client = true;
                             let settings = StringMap::from_bytes(&data);
                             
@@ -246,6 +257,7 @@ impl Session {
                 }
                 CMD_UPDATE_PADDING_SCHEME => {
                     if length > 0 {
+                        // `rawScheme` Do not use buffer to prevent subsequent misuse
                         let mut raw_scheme = vec![0u8; length];
                         {
                             let mut conn = self.conn.lock().await;
@@ -279,6 +291,7 @@ impl Session {
                         }
                         
                         if self.is_client {
+                            // Check server's version
                             let settings = StringMap::from_bytes(&data);
                             if let Some(version_str) = settings.get("v") {
                                 if let Ok(version) = version_str.parse::<u8>() {
