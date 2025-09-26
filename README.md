@@ -47,6 +47,12 @@ cargo run --bin anytls-client -- -l 0.0.0.0:1080 -s server_ip:port -p password
   - glommio运行时，减少跨线程唤醒和全局队列竞争；
   - time_total:  0.024587
 
+### Features
+
+depth：
+1. 数据帧的头使用bincode序列化与反序列化；
+2. 与 anytls-go 不兼容，需要 server 及 client 全使用 rs 版；
+3. 编译 `cargo build --features depth --bin anytls-server --bin anytls-client`；
 
 ### sing-box
 
