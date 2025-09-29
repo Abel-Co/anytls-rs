@@ -65,14 +65,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut auth_data = Vec::new();
                 auth_data.extend_from_slice(&password_sha256);
                 
-                let padding_factory = padding.read().await;
-                let padding_sizes = padding_factory.generate_record_payload_sizes(0);
+                let padding_sizes = padding.generate_record_payload_sizes(0);
                 let padding_len = if !padding_sizes.is_empty() {
                     padding_sizes[0] as u16
                 } else {
                     0
                 };
-                drop(padding_factory);
                 
                 auth_data.extend_from_slice(&padding_len.to_be_bytes());
                 if padding_len > 0 {
@@ -105,7 +103,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Arc::new(session))
             }))
         }),
-        padding,
         std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(30),
         5,

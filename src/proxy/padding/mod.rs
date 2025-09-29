@@ -1,7 +1,6 @@
 use crate::util::string_map::{StringMap, StringMapExt};
 use rand::Rng;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 pub const CHECK_MARK: i32 = -1;
 
@@ -93,8 +92,8 @@ impl PaddingFactory {
 pub struct DefaultPaddingFactory;
 
 impl DefaultPaddingFactory {
-    pub fn load() -> Arc<RwLock<PaddingFactory>> {
-        Arc::new(RwLock::new(PaddingFactory::default()))
+    pub fn load() -> Arc<PaddingFactory> {
+        Arc::new(PaddingFactory::default())
     }
     
     pub async fn update(raw_scheme: &[u8]) -> bool {

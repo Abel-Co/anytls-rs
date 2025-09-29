@@ -73,7 +73,7 @@ async fn handle_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     password_sha256: Vec<u8>,
-    padding: Arc<tokio::sync::RwLock<anytls_rs::proxy::padding::PaddingFactory>>,
+    padding: Arc<anytls_rs::proxy::padding::PaddingFactory>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tls_stream = acceptor.accept(stream).await?;
     

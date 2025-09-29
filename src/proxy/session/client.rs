@@ -1,10 +1,9 @@
-use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::{Session, Stream};
 use crate::util::r#type::DialOutFunc;
 use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::time::interval;
 
 pub struct Client {
@@ -12,7 +11,6 @@ pub struct Client {
     sessions: Arc<Mutex<IndexMap<u64, Arc<Session>>>>,
     idle_sessions: Arc<Mutex<Vec<(u64, Arc<Session>, Instant)>>>,
     session_counter: Arc<Mutex<u64>>,
-    padding: Arc<RwLock<PaddingFactory>>,
     idle_session_timeout: Duration,
     min_idle_sessions: usize,
 }
@@ -20,7 +18,6 @@ pub struct Client {
 impl Client {
     pub fn new(
         dial_out: DialOutFunc,
-        padding: Arc<RwLock<PaddingFactory>>,
         idle_session_check_interval: Duration,
         idle_session_timeout: Duration,
         min_idle_sessions: usize,
@@ -30,7 +27,6 @@ impl Client {
             sessions: Arc::new(Mutex::new(IndexMap::new())),
             idle_sessions: Arc::new(Mutex::new(Vec::new())),
             session_counter: Arc::new(Mutex::new(0)),
-            padding,
             idle_session_timeout,
             min_idle_sessions,
         };

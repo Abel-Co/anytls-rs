@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use bytes::BytesMut;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct Session {
@@ -20,7 +20,7 @@ pub struct Session {
     closed: Arc<Mutex<bool>>,
     is_client: bool,
     peer_version: Arc<Mutex<u8>>,
-    padding: Arc<RwLock<PaddingFactory>>,
+    padding: Arc<PaddingFactory>,
     send_padding: Arc<Mutex<bool>>,
     buffering: Arc<Mutex<bool>>,
     buffer: Arc<Mutex<Vec<u8>>>,
@@ -31,7 +31,7 @@ pub struct Session {
 impl Session {
     pub fn new_client(
         conn: Box<dyn crate::util::r#type::AsyncReadWrite>,
-        padding: Arc<RwLock<PaddingFactory>>,
+        padding: Arc<PaddingFactory>,
     ) -> Self {
         Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -52,7 +52,7 @@ impl Session {
     pub fn new_server(
         conn: Box<dyn crate::util::r#type::AsyncReadWrite>,
         on_new_stream: Box<dyn Fn(Arc<Stream>) + Send + Sync>,
-        padding: Arc<RwLock<PaddingFactory>>,
+        padding: Arc<PaddingFactory>,
     ) -> Self {
         Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -81,12 +81,10 @@ impl Session {
     }
     
     pub async fn send_settings(&self) -> io::Result<()> {
-        let padding = self.padding.read().await;
         let mut settings = StringMap::new();
         settings.insert("v".to_string(), "2".to_string());
         settings.insert("client".to_string(), PROGRAM_VERSION_NAME.to_string());
-        settings.insert("padding-md5".to_string(), padding.md5().to_string());
-        drop(padding);
+        settings.insert("padding-md5".to_string(), self.padding.md5().to_string());
         
         let frame = Frame::with_data(CMD_SETTINGS, 0, settings.to_bytes().into());
         self.write_frame(frame).await?;
@@ -124,7 +122,7 @@ impl Session {
             match cmd {
                 CMD_PSH => {
                     if length > 0 {
-                        let mut data = vec![0u8; length];
+                        let data = vec![0u8; length];
                         let mut payload = BytesMut::new();
                         {
                             let mut conn = self.conn.lock().await;
@@ -215,9 +213,8 @@ impl Session {
                             let settings = StringMap::from_bytes(&data);
                             
                             // 检查填充方案
-                            let padding = self.padding.read().await;
-                            if settings.get("padding-md5") != Some(&padding.md5().to_string()) {
-                                let frame = Frame::with_data(CMD_UPDATE_PADDING_SCHEME, 0, padding.raw_scheme().to_vec().into());
+                            if settings.get("padding-md5") != Some(&self.padding.md5().to_string()) {
+                                let frame = Frame::with_data(CMD_UPDATE_PADDING_SCHEME, 0, self.padding.raw_scheme().to_vec().into());
                                 self.write_frame(frame).await?;
                             }
                             
@@ -346,9 +343,8 @@ impl Session {
             let pkt = *pkt_counter;
             drop(pkt_counter);
             
-            let padding = self.padding.read().await;
-            if pkt < padding.stop() {
-                let pkt_sizes = padding.generate_record_payload_sizes(pkt);
+            if pkt < self.padding.stop() {
+                let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
                 let mut total_written = 0;
                 let mut remaining_data = data;
                 
