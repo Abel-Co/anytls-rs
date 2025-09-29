@@ -18,7 +18,7 @@ static DEFAULT_PADDING_SCHEME: &str = r#"stop=8
 #[derive(Clone)]
 pub struct PaddingFactory {
     scheme: StringMap,
-    raw_scheme: Vec<u8>,
+    raw_scheme: bytes::Bytes,
     stop: u32,
     md5: String,
 }
@@ -35,13 +35,14 @@ impl PaddingFactory {
         if scheme.is_empty() {
             return None;
         }
-        
+
         let stop = scheme.get("stop")?.parse::<u32>().ok()?;
-        let md5 = format!("{:x}", md5::compute(raw_scheme));
-        
+        let bytes = bytes::Bytes::copy_from_slice(raw_scheme);
+        let md5 = format!("{:x}", md5::compute(&bytes));
+
         Some(Self {
             scheme,
-            raw_scheme: raw_scheme.to_vec(),
+            raw_scheme: bytes,
             stop,
             md5,
         })

@@ -9,6 +9,7 @@ use crate::util::r#type::AsyncReadWrite;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use bytes::BytesMut;
 use tokio::sync::{Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -80,11 +81,10 @@ impl Session {
     }
     
     pub async fn send_settings(&self) -> io::Result<()> {
+        let padding = self.padding.read().await;
         let mut settings = StringMap::new();
         settings.insert("v".to_string(), "2".to_string());
         settings.insert("client".to_string(), PROGRAM_VERSION_NAME.to_string());
-        
-        let padding = self.padding.read().await;
         settings.insert("padding-md5".to_string(), padding.md5().to_string());
         drop(padding);
         
@@ -106,17 +106,14 @@ impl Session {
             }
             
             // 读取头部信息 (7字节)
-            let mut header_buf = vec![0u8; HEADER_OVERHEAD_SIZE];
+            let mut header_bytes = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE);
             {
                 let mut conn = self.conn.lock().await;
-                conn.read_exact(&mut header_buf).await?;
+                conn.read_exact(&mut header_bytes).await?;
             }
             
-            let header = match RawHeader::from_bytes(&header_buf) {
-                Some(h) => h,
-                None => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid header"));
-                }
+            let Some(header) = RawHeader::from_bytes(header_bytes) else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid header"));
             };
             
             let sid = header.sid;
@@ -128,15 +125,17 @@ impl Session {
                 CMD_PSH => {
                     if length > 0 {
                         let mut data = vec![0u8; length];
+                        let mut payload = BytesMut::new();
                         {
                             let mut conn = self.conn.lock().await;
-                            conn.read_exact(&mut data).await?;
+                            conn.read_exact(&mut payload).await?;
                         }
                         
                         let streams = self.streams.lock().await;
                         if let Some(stream) = streams.get(&sid) {
                             // 将数据写入流
                             if let Err(e) = stream.write(&data).await {
+                                // todo let Ok(frame) = Frame::from_bytes(payload) else {}
                                 log::warn!("Failed to write to stream {}: {}", sid, e);
                             }
                         }
@@ -310,7 +309,9 @@ impl Session {
     }
     
     pub async fn write_frame(&self, frame: Frame) -> io::Result<usize> {
-        let data = frame.to_bytes();
+        let Ok(data) = frame.to_bytes() else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Frame payload too large"));
+        };
         self.write_conn(&data).await
     }
     
