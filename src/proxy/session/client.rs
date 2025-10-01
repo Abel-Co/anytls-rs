@@ -1,132 +1,187 @@
+use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::{Session, Stream};
 use crate::util::r#type::DialOutFunc;
-use indexmap::IndexMap;
+use std::collections::VecDeque;
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tokio::time::interval;
+use tokio::time::Duration;
 
+/// 客户端连接管理器，实现连接复用
 pub struct Client {
+    // 连接函数
     dial_out: DialOutFunc,
-    sessions: Arc<Mutex<IndexMap<u64, Arc<Session>>>>,
-    idle_sessions: Arc<Mutex<Vec<(u64, Arc<Session>, Instant)>>>,
-    session_counter: Arc<Mutex<u64>>,
-    idle_session_timeout: Duration,
+    
+    // 填充工厂
+    padding: Arc<PaddingFactory>,
+    
+    // 空闲 Session 管理
+    idle_sessions: Arc<Mutex<VecDeque<Arc<Session>>>>,
+    
+    // 配置
+    idle_timeout: Duration,
     min_idle_sessions: usize,
+    
+    // 状态
+    closed: AtomicBool,
 }
 
 impl Client {
+    /// 创建新的客户端
     pub fn new(
         dial_out: DialOutFunc,
-        idle_session_check_interval: Duration,
-        idle_session_timeout: Duration,
+        padding: Arc<PaddingFactory>,
+        idle_timeout: Duration,
         min_idle_sessions: usize,
     ) -> Self {
         let client = Self {
             dial_out,
-            sessions: Arc::new(Mutex::new(IndexMap::new())),
-            idle_sessions: Arc::new(Mutex::new(Vec::new())),
-            session_counter: Arc::new(Mutex::new(0)),
-            idle_session_timeout,
+            padding,
+            idle_sessions: Arc::new(Mutex::new(VecDeque::new())),
+            idle_timeout,
             min_idle_sessions,
+            closed: AtomicBool::new(false),
         };
         
-        // Start idle cleanup routine
-        let idle_sessions = client.idle_sessions.clone();
-        let idle_timeout = client.idle_session_timeout;
-        let min_idle = client.min_idle_sessions;
-        
-        tokio::spawn(async move {
-            let mut interval = interval(idle_session_check_interval);
-            loop {
-                interval.tick().await;
-                Self::idle_cleanup(&idle_sessions, idle_timeout, min_idle).await;
-            }
-        });
+        // 启动定期清理任务
+        client.start_cleanup_task();
         
         client
     }
-    
-    pub async fn create_stream(&self) -> Result<Arc<Stream>, std::io::Error> {
-        let session = self.find_or_create_session().await?;
+
+    /// 创建新的 Stream
+    pub async fn create_stream(&self) -> io::Result<Stream> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Client closed"));
+        }
+
+        // 尝试获取空闲的 Session
+        if let Some(session) = self.get_idle_session().await {
+            log::debug!("Reusing idle session");
+            return session.open_stream().await;
+        }
+
+        // 创建新的 Session
+        let session = self.create_session().await?;
+        log::debug!("Created new session");
+        
         session.open_stream().await
     }
-    
-    async fn find_or_create_session(&self) -> Result<Arc<Session>, std::io::Error> {
-        // Try to find an idle session first
-        if let Some(session) = self.find_idle_session().await {
-            return Ok(session);
-        }
-        
-        // Create a new session
-        self.create_session().await
+
+    /// 手动将 Session 放回空闲池（由外部调用）
+    pub async fn return_session_to_idle(&self, session: Arc<Session>) {
+        self.return_to_idle(session).await;
     }
-    
-    async fn find_idle_session(&self) -> Option<Arc<Session>> {
+
+    /// 获取空闲的 Session
+    async fn get_idle_session(&self) -> Option<Arc<Session>> {
         let mut idle_sessions = self.idle_sessions.lock().await;
-        if let Some((_, session, _)) = idle_sessions.pop() {
-            Some(session)
-        } else {
-            None
-        }
+        
+        // 直接返回第一个可用的 Session
+        // 注意：这里没有过期检查，因为 VecDeque 设计更简单
+        // 如果需要过期检查，可以考虑在 Session 内部添加时间戳
+        idle_sessions.pop_front()
     }
-    
-    async fn create_session(&self) -> Result<Arc<Session>, std::io::Error> {
-        log::debug!("Creating new session...");
-        // dial_out now returns a Session directly
-        let session = (self.dial_out)().await?;
+
+    /// 创建新的 Session
+    async fn create_session(&self) -> io::Result<Arc<Session>> {
+        // 建立连接
+        let conn = (self.dial_out)().await?;
         
-        let mut counter = self.session_counter.lock().await;
-        *counter += 1;
-        let seq = *counter;
-        drop(counter);
-        
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(seq, session.clone());
-        drop(sessions);
-        
-        log::debug!("Session created and registered");
+        // 创建 Session
+        let session = Arc::new(Session::new_client(conn, self.padding.clone()));
+
+        // 启动 Session
+        let session_clone = session.clone();
+        tokio::spawn(async move {
+            if let Err(e) = session_clone.run().await {
+                log::error!("Session run error: {}", e);
+            }
+        });
+
         Ok(session)
     }
-    
-    async fn idle_cleanup(
-        idle_sessions: &Arc<Mutex<Vec<(u64, Arc<Session>, Instant)>>>,
-        timeout: Duration,
-        min_idle: usize,
-    ) {
-        let mut sessions = idle_sessions.lock().await;
-        let now = Instant::now();
-        let mut active_count = 0;
-        let mut to_remove = Vec::new();
+
+    /// 将 Session 放回空闲池
+    async fn return_to_idle(&self, session: Arc<Session>) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let mut idle_sessions = self.idle_sessions.lock().await;
+        idle_sessions.push_back(session);
         
-        for (i, (_, _session, idle_since)) in sessions.iter().enumerate() {
-            if now.duration_since(*idle_since) < timeout {
-                active_count += 1;
-                continue;
-            }
-            
-            if active_count < min_idle {
-                active_count += 1;
-                continue;
-            }
-            
-            to_remove.push(i);
+        // 保持最小空闲 Session 数量
+        if idle_sessions.len() > self.min_idle_sessions * 2 {
+            idle_sessions.truncate(self.min_idle_sessions);
         }
         
-        // Remove old sessions
-        for &i in to_remove.iter().rev() {
-            if i < sessions.len() {
-                let (_, session, _) = sessions.swap_remove(i);
-                let _ = session.close().await;
+        log::debug!("Session returned to idle pool");
+    }
+
+
+
+    /// 启动定期清理任务
+    fn start_cleanup_task(&self) {
+        let client = self.clone();
+        let cleanup_interval = Duration::from_secs(30); // 每30秒清理一次
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(cleanup_interval);
+            loop {
+                interval.tick().await;
+                
+                if client.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                
+                client.cleanup_idle_sessions().await;
+                log::debug!("Performed idle session cleanup");
+            }
+        });
+    }
+
+    /// 清理空闲的 Session
+    pub async fn cleanup_idle_sessions(&self) {
+        let mut idle_sessions = self.idle_sessions.lock().await;
+        
+        // 保持最小空闲 Session 数量
+        if idle_sessions.len() > self.min_idle_sessions {
+            let excess = idle_sessions.len() - self.min_idle_sessions;
+            for _ in 0..excess {
+                if let Some(session) = idle_sessions.pop_front() {
+                    session.close().await.ok();
+                }
             }
         }
     }
-    
-    pub async fn close(&self) -> Result<(), std::io::Error> {
-        let sessions = self.sessions.lock().await;
-        for session in sessions.values() {
-            let _ = session.close().await;
+
+    /// 关闭客户端
+    pub async fn close(&self) -> io::Result<()> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
         }
+
+        // 清空空闲 Session
+        let mut idle_sessions = self.idle_sessions.lock().await;
+        for session in idle_sessions.drain(..) {
+            session.close().await.ok();
+        }
+
         Ok(())
+    }
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Self {
+            dial_out: self.dial_out.clone(),
+            padding: self.padding.clone(),
+            idle_sessions: self.idle_sessions.clone(),
+            idle_timeout: self.idle_timeout,
+            min_idle_sessions: self.min_idle_sessions,
+            closed: AtomicBool::new(self.closed.load(Ordering::Acquire)),
+        }
     }
 }

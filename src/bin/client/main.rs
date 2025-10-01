@@ -1,14 +1,16 @@
-use anytls_rs::proxy::padding::DefaultPaddingFactory;
+use anytls_rs::proxy::padding::{DefaultPaddingFactory, PaddingFactory};
 use anytls_rs::proxy::session::Client;
 use anytls_rs::util::PROGRAM_VERSION_NAME;
 use clap::Parser;
 use log::{error, info};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use bytes::{BufMut, BytesMut};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "anytls-client")]
@@ -38,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     
-    let password_sha256 = Sha256::digest(args.password.as_bytes());
+    let password_sha256: [u8; 32] = Sha256::digest(args.password.as_bytes()).into();
     
     info!("[Client] {}", PROGRAM_VERSION_NAME);
     info!("[Client] SOCKS5 {} => {}", args.listen, args.server);
@@ -48,76 +50,237 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_config = create_tls_config(args.sni.as_deref())?;
     let padding = DefaultPaddingFactory::load();
     
-    let padding_clone = padding.clone();
-    let client = Arc::new(Client::new(
-        Box::new(move || {
-            let server = args.server.clone();
-            let tls_config = tls_config.clone();
-            let password_sha256 = password_sha256.clone();
-            let padding = padding_clone.clone();
-            
-            Box::new(Box::pin(async move {
-                let stream = TcpStream::connect(&server).await?;
-                let connector = TlsConnector::from(tls_config);
-                let mut tls_stream = connector.connect("127.0.0.1".try_into().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?, stream).await?;
+    // 创建客户端
+    let dial_out = create_dial_out_func(args.server.clone(), tls_config, args.sni, password_sha256, padding.clone());
+    let client = Client::new(
+        dial_out,
+        padding,
+        Duration::from_secs(30), // 空闲超时
+        1, // 最小空闲连接数
+    );
+    
+    info!("[Client] Listening on {}", args.listen);
+    
+    // 监听 SOCKS5 连接
+    loop {
+        match listener.accept().await {
+            Ok((client_conn, addr)) => {
+                info!("[Client] New connection from {}", addr);
                 
-                // Send authentication
-                let mut auth_data = Vec::new();
-                auth_data.extend_from_slice(&password_sha256);
-                
-                let padding_sizes = padding.generate_record_payload_sizes(0);
-                let padding_len = if !padding_sizes.is_empty() {
-                    padding_sizes[0] as u16
-                } else {
-                    0
-                };
-                
-                auth_data.extend_from_slice(&padding_len.to_be_bytes());
-                if padding_len > 0 {
-                    auth_data.resize(auth_data.len() + padding_len as usize, 0);
-                }
-                
-                // Send auth data
-                tls_stream.write_all(&auth_data).await?;
-                
-                // 立即创建Session并发送cmdSettings
-                let session = anytls_rs::proxy::session::Session::new_client(
-                    Box::new(tls_stream),
-                    padding,
-                );
-                
-                // 立即发送cmdSettings
-                if let Err(e) = session.send_settings().await {
-                    log::error!("Failed to send settings: {}", e);
-                    return Err(e);
-                }
-                
-                // 启动Session的接收循环
-                let session_clone = session.clone();
+                // 为每个连接创建新的任务
+                let client_clone = client.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = session_clone.recv_loop().await {
-                        log::error!("Session recv_loop error: {}", e);
+                    if let Err(e) = handle_client_connection(client_conn, client_clone).await {
+                        error!("[Client] Connection error: {}", e);
                     }
                 });
-                
-                Ok(Arc::new(session))
-            }))
-        }),
-        std::time::Duration::from_secs(30),
-        std::time::Duration::from_secs(30),
-        5,
-    ));
-    
-    loop {
-        let (stream, _addr) = listener.accept().await?;
-        let client = client.clone();
-        
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, client).await {
-                error!("Connection error: {}", e);
             }
-        });
+            Err(e) => {
+                error!("[Client] Accept error: {}", e);
+            }
+        }
     }
+}
+
+async fn handle_client_connection(
+    mut client_conn: TcpStream,
+    client: Client,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 读取 SOCKS5 握手
+    let mut buffer = [0u8; 1024];
+    let n = client_conn.read(&mut buffer).await?;
+    
+    if n < 3 {
+        return Err("Invalid SOCKS5 handshake".into());
+    }
+    
+    // 检查版本
+    if buffer[0] != 0x05 {
+        return Err("Unsupported SOCKS version".into());
+    }
+    
+    // 检查认证方法数量
+    let nmethods = buffer[1] as usize;
+    if n < 2 + nmethods {
+        return Err("Invalid SOCKS5 handshake".into());
+    }
+    
+    // 检查是否有无认证方法
+    let mut has_no_auth = false;
+    for i in 2..2 + nmethods {
+        if buffer[i] == 0x00 {
+            has_no_auth = true;
+            break;
+        }
+    }
+    
+    if !has_no_auth {
+        return Err("No acceptable authentication method".into());
+    }
+    
+    // 发送认证响应
+    client_conn.write_all(&[0x05, 0x00]).await?;
+    
+    // 读取连接请求
+    let n = client_conn.read(&mut buffer).await?;
+    if n < 10 {
+        return Err("Invalid SOCKS5 request".into());
+    }
+    
+    // 检查版本和命令
+    if buffer[0] != 0x05 || buffer[1] != 0x01 {
+        return Err("Unsupported SOCKS5 command".into());
+    }
+    
+    // 解析目标地址
+    let addr_type = buffer[3];
+    let target_addr: String;
+    let port: u16;
+    
+    (target_addr, port) = match addr_type {
+        0x01 => { // IPv4
+            if n < 10 {
+                return Err("Invalid IPv4 address".into());
+            }
+            let addr = format!("{}.{}.{}.{}", buffer[4], buffer[5], buffer[6], buffer[7]);
+            let port = u16::from_be_bytes([buffer[8], buffer[9]]);
+            (addr, port)
+        }
+        0x03 => { // 域名
+            let domain_len = buffer[4] as usize;
+            if n < 7 + domain_len {
+                return Err("Invalid domain name".into());
+            }
+            let addr = String::from_utf8_lossy(&buffer[5..5 + domain_len]).to_string();
+            let port = u16::from_be_bytes([buffer[5 + domain_len], buffer[6 + domain_len]]);
+            (addr, port)
+        }
+        _ => {
+            return Err("Unsupported address type".into());
+        }
+    };
+    
+    info!("[Client] Connecting to {}:{}", target_addr, port);
+    
+    // 创建到目标服务器的连接
+    let _target_conn = TcpStream::connect(format!("{}:{}", target_addr, port)).await?;
+    
+    // 发送连接成功响应
+    let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    client_conn.write_all(&response).await?;
+    
+    // 创建 AnyTLS 流
+    let anytls_stream = client.create_stream().await?;
+    
+    // 使用真正的并行数据转发
+    let (mut client_read, mut client_write) = client_conn.split();
+    let (mut anytls_read, mut anytls_write) = anytls_stream.split();
+    
+    // 使用 tokio::join! 而不是 tokio::spawn 来避免生命周期问题
+    let client_to_target = async move {
+        match tokio::io::copy(&mut client_read, &mut anytls_write).await {
+            Ok(bytes) => {
+                info!("[Client] Client to target copy completed: {} bytes", bytes);
+            }
+            Err(e) => {
+                error!("[Client] Client to target copy error: {}", e);
+            }
+        }
+    };
+    
+    let target_to_client = async move {
+        match tokio::io::copy(&mut anytls_read, &mut client_write).await {
+            Ok(bytes) => {
+                info!("[Client] Target to client copy completed: {} bytes", bytes);
+            }
+            Err(e) => {
+                error!("[Client] Target to client copy error: {}", e);
+            }
+        }
+    };
+    
+    // 等待两个任务都完成
+    tokio::join!(client_to_target, target_to_client);
+    
+    // 注意：这里我们没有显式地将 Session 放回空闲池
+    // 因为当前的架构中，每个连接都创建新的 Stream
+    // 在实际使用中，应该根据业务逻辑来决定是否复用 Session
+    
+    Ok(())
+}
+
+fn create_dial_out_func(
+    server_addr: String,
+    tls_config: Arc<ClientConfig>,
+    sni: Option<String>,
+    password_sha256: [u8; 32],
+    padding: Arc<PaddingFactory>,
+) -> anytls_rs::util::r#type::DialOutFunc {
+    Arc::new(move || {
+        let server_addr = server_addr.clone();
+        let tls_config = tls_config.clone();
+        let sni = sni.clone();
+        let password_sha256 = password_sha256;
+        let padding = padding.clone();
+        
+        Box::new(Box::pin(async move {
+            // 建立 TCP 连接
+            let tcp_stream = TcpStream::connect(&server_addr).await?;
+            
+            // 建立 TLS 连接
+            let server_name = sni.unwrap_or_else(|| "localhost".to_string());
+            let server_name = server_name.try_into().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            
+            let tls_connector = TlsConnector::from(tls_config);
+            let mut tls_stream = tls_connector.connect(server_name, tcp_stream).await?;
+            
+            // 发送认证请求
+            send_authentication(&mut tls_stream, password_sha256, padding.clone()).await?;
+            
+            Ok(Box::new(tls_stream) as Box<dyn anytls_rs::util::r#type::AsyncReadWrite>)
+        }))
+    })
+}
+
+/// 发送认证请求
+async fn send_authentication(
+    tls_stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    password_sha256: [u8; 32],
+    padding: Arc<PaddingFactory>,
+) -> Result<(), std::io::Error> {
+    // 根据协议文档，认证请求格式为：
+    // | sha256(password) | padding0 length | padding0 |
+    // | 32 Bytes        | Big-Endian uint16 | Variable length |
+    
+    // 使用统一的 padding 方案生成填充数据
+    // 对于认证请求，我们使用 pkt=0 的配置
+    let padding_sizes = padding.generate_record_payload_sizes(0);
+    
+    // 选择第一个有效的填充大小，如果没有则使用默认值
+    let padding_length = padding_sizes.get(0).copied().unwrap_or(30) as u16;
+    
+    // 使用统一的填充数据生成方法
+    let padding_data = padding.rng_vec(padding_length as usize);
+    
+    // 构建认证请求
+    let mut auth_request = BytesMut::with_capacity(32 + 2 + padding_length as usize);
+    
+    // 添加 SHA256 哈希
+    auth_request.extend_from_slice(&password_sha256);
+    
+    // 添加 padding0 长度（大端序）
+    auth_request.put_u16(padding_length);
+    
+    // 添加 padding0 数据
+    auth_request.extend_from_slice(&padding_data);
+    
+    // 发送认证请求
+    tls_stream.write_all(&auth_request).await?;
+    tls_stream.flush().await?;
+    
+    info!("[Client] Authentication request sent (padding: {} bytes)", padding_length);
+    
+    Ok(())
 }
 
 fn create_tls_config(_sni: Option<&str>) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
@@ -182,130 +345,4 @@ impl rustls::client::danger::ServerCertVerifier for AllowAnyCertVerifier {
             rustls::SignatureScheme::ED448,
         ]
     }
-}
-
-async fn handle_connection(
-    mut stream: TcpStream,
-    client: Arc<Client>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // SOCKS5 握手处理
-    let mut buffer = vec![0u8; 1024];
-    
-    // 读取客户端版本和认证方法
-    let n = stream.read(&mut buffer).await?;
-    if n < 3 {
-        return Err("Invalid SOCKS5 request".into());
-    }
-    
-    let version = buffer[0];
-    let nmethods = buffer[1] as usize;
-    
-    if version != 5 {
-        return Err("Unsupported SOCKS version".into());
-    }
-    
-    if n < 2 + nmethods {
-        return Err("Incomplete SOCKS5 request".into());
-    }
-    
-    // 检查是否支持无认证方法
-    let mut supports_no_auth = false;
-    for i in 2..2 + nmethods {
-        if buffer[i] == 0 {
-            supports_no_auth = true;
-            break;
-        }
-    }
-    
-    if !supports_no_auth {
-        return Err("No supported authentication method".into());
-    }
-    
-    // 发送认证方法选择响应
-    let response = [5, 0]; // 版本5，无认证
-    stream.write_all(&response).await?;
-    
-    // 读取连接请求
-    let n = stream.read(&mut buffer).await?;
-    if n < 10 {
-        return Err("Invalid SOCKS5 connect request".into());
-    }
-    
-    let version = buffer[0];
-    let cmd = buffer[1];
-    let _rsv = buffer[2];
-    let atyp = buffer[3];
-    
-    if version != 5 || cmd != 1 {
-        return Err("Unsupported SOCKS5 command".into());
-    }
-    
-    // 解析目标地址
-    let target_addr: String;
-    let target_port: u16;
-    
-    match atyp {
-        1 => { // IPv4
-            if n < 10 {
-                return Err("Incomplete IPv4 address".into());
-            }
-            target_addr = format!("{}.{}.{}.{}", buffer[4], buffer[5], buffer[6], buffer[7]);
-            target_port = u16::from_be_bytes([buffer[8], buffer[9]]);
-        }
-        3 => { // 域名
-            let domain_len = buffer[4] as usize;
-            if n < 5 + domain_len + 2 {
-                return Err("Incomplete domain address".into());
-            }
-            target_addr = String::from_utf8_lossy(&buffer[5..5 + domain_len]).to_string();
-            target_port = u16::from_be_bytes([buffer[5 + domain_len], buffer[5 + domain_len + 1]]);
-        }
-        _ => return Err("Unsupported address type".into()),
-    }
-    
-    let target = format!("{}:{}", target_addr, target_port);
-    log::info!("Connecting to target: {}", target);
-    
-    // 创建到代理服务器的连接
-    let proxy_stream = client.create_stream().await?;
-    
-    // 发送目标地址到代理服务器
-    let mut addr_data = Vec::new();
-    addr_data.push(atyp); // 地址类型
-    match atyp {
-        1 => { // IPv4
-            addr_data.extend_from_slice(&buffer[4..8]); // IP地址
-            addr_data.extend_from_slice(&buffer[8..10]); // 端口
-        }
-        3 => { // 域名
-            let domain_len = buffer[4] as usize;
-            addr_data.push(domain_len as u8);
-            addr_data.extend_from_slice(&buffer[5..5 + domain_len]);
-            addr_data.extend_from_slice(&buffer[5 + domain_len..5 + domain_len + 2]);
-        }
-        _ => return Err("Unsupported address type".into()),
-    }
-    
-    // 发送地址数据到代理服务器
-    proxy_stream.write(&addr_data).await?;
-    
-    // 发送连接成功响应
-    let response = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]; // 成功响应
-    stream.write_all(&response).await?;
-    
-    // 开始数据转发：客户端 <-> 代理服务器
-    let (mut client_read, mut client_write) = stream.split();
-    let (mut proxy_read, mut proxy_write) = proxy_stream.split_ref();
-    
-    // 双向数据转发
-    tokio::select! {
-        _ = tokio::io::copy(&mut client_read, &mut proxy_write) => {
-            log::debug!("Client to proxy stream ended");
-        }
-        _ = tokio::io::copy(&mut proxy_read, &mut client_write) => {
-            log::debug!("Proxy to client stream ended");
-        }
-    }
-    
-    Ok(())
 }

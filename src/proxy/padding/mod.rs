@@ -87,6 +87,11 @@ impl PaddingFactory {
     pub fn stop(&self) -> u32 {
         self.stop
     }
+    
+    /// 生成随机填充数据，使填充数据更像真实数据
+    pub fn rng_vec(&self, length: usize) -> Vec<u8> {
+        (0..length).map(|_| fastrand::u8(..)).collect()
+    }
 }
 
 pub struct DefaultPaddingFactory;
