@@ -86,9 +86,12 @@ async fn handle_client_connection(
     mut client_conn: TcpStream,
     client: Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    log::debug!("[Client] Starting SOCKS5 handshake");
+    
     // 读取 SOCKS5 握手
     let mut buffer = [0u8; 1024];
     let n = client_conn.read(&mut buffer).await?;
+    log::debug!("[Client] Received {} bytes for SOCKS5 handshake: {:?}", n, &buffer[..n]);
     
     if n < 3 {
         return Err("Invalid SOCKS5 handshake".into());
@@ -101,6 +104,7 @@ async fn handle_client_connection(
     
     // 检查认证方法数量
     let nmethods = buffer[1] as usize;
+    log::debug!("[Client] Number of authentication methods: {}", nmethods);
     if n < 2 + nmethods {
         return Err("Invalid SOCKS5 handshake".into());
     }
@@ -118,11 +122,15 @@ async fn handle_client_connection(
         return Err("No acceptable authentication method".into());
     }
     
+    log::debug!("[Client] Authentication method accepted (no auth)");
+    
     // 发送认证响应
     client_conn.write_all(&[0x05, 0x00]).await?;
+    log::debug!("[Client] Sent authentication response");
     
     // 读取连接请求
     let n = client_conn.read(&mut buffer).await?;
+    log::debug!("[Client] Received {} bytes for connection request: {:?}", n, &buffer[..n]);
     if n < 10 {
         return Err("Invalid SOCKS5 request".into());
     }
@@ -134,6 +142,7 @@ async fn handle_client_connection(
     
     // 解析目标地址
     let addr_type = buffer[3];
+    log::debug!("[Client] Address type: {}", addr_type);
     let target_addr: String;
     let port: u16;
     
@@ -148,6 +157,7 @@ async fn handle_client_connection(
         }
         0x03 => { // 域名
             let domain_len = buffer[4] as usize;
+            log::debug!("[Client] Domain length: {}", domain_len);
             if n < 7 + domain_len {
                 return Err("Invalid domain name".into());
             }
@@ -162,15 +172,15 @@ async fn handle_client_connection(
     
     info!("[Client] Connecting to {}:{}", target_addr, port);
     
-    // 创建到目标服务器的连接
-    let _target_conn = TcpStream::connect(format!("{}:{}", target_addr, port)).await?;
+    // 创建 AnyTLS 流
+    log::debug!("[Client] Creating AnyTLS stream");
+    let anytls_stream = client.create_stream().await?;
+    log::info!("[Client] AnyTLS stream created successfully");
     
     // 发送连接成功响应
     let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     client_conn.write_all(&response).await?;
-    
-    // 创建 AnyTLS 流
-    let anytls_stream = client.create_stream().await?;
+    log::debug!("[Client] Sent SOCKS5 connection success response");
     
     // 使用真正的并行数据转发
     let (mut client_read, mut client_write) = client_conn.split();
@@ -225,17 +235,24 @@ fn create_dial_out_func(
         
         Box::new(Box::pin(async move {
             // 建立 TCP 连接
+            log::debug!("[Client] Connecting to AnyTLS server at {}", server_addr);
             let tcp_stream = TcpStream::connect(&server_addr).await?;
+            log::info!("[Client] TCP connection to AnyTLS server established");
             
             // 建立 TLS 连接
             let server_name = sni.unwrap_or_else(|| "localhost".to_string());
+            log::debug!("[Client] Using SNI: {}", server_name);
             let server_name = server_name.try_into().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             
             let tls_connector = TlsConnector::from(tls_config);
+            log::debug!("[Client] Starting TLS handshake");
             let mut tls_stream = tls_connector.connect(server_name, tcp_stream).await?;
+            info!("[Client] TLS handshake completed");
             
             // 发送认证请求
+            log::debug!("[Client] Sending authentication request");
             send_authentication(&mut tls_stream, password_sha256, padding.clone()).await?;
+            log::info!("[Client] Authentication completed");
             
             Ok(Box::new(tls_stream) as Box<dyn anytls_rs::util::r#type::AsyncReadWrite>)
         }))

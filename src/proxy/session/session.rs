@@ -98,18 +98,24 @@ impl Session {
 
     /// 启动 Session
     pub async fn run(&self) -> io::Result<()> {
+        log::info!("[Session] Starting session (client: {})", self.is_client);
+        
         if self.is_client {
             // 客户端发送设置
+            log::debug!("[Session] Sending client settings");
             self.send_client_settings().await?;
+            log::info!("[Session] Client settings sent");
         }
 
         // 直接运行接收循环
+        log::debug!("[Session] Starting receive loop");
         self.recv_loop().await
     }
 
     /// 发送客户端设置
     async fn send_client_settings(&self) -> io::Result<()> {
         if self.settings_sent.swap(true, Ordering::AcqRel) {
+            log::debug!("[Session] Settings already sent, skipping");
             return Ok(());
         }
 
@@ -119,10 +125,13 @@ impl Session {
             ("padding-md5".to_string(), self.padding.md5().to_string()),
         ]);
 
+        log::debug!("[Session] Client settings: {:?}", settings);
         let frame = Frame::with_data(CMD_SETTINGS, 0, Bytes::from(settings.to_bytes()));
         self.write_control_frame(frame).await?;
+        log::debug!("[Session] Client settings frame sent");
         
         self.buffering.store(true, Ordering::Release);
+        log::debug!("[Session] Buffering enabled");
         Ok(())
     }
 
@@ -151,6 +160,7 @@ impl Session {
         // 发送 SYN 帧
         let frame = Frame::new(CMD_SYN, stream_id);
         self.write_control_frame(frame).await?;
+        log::debug!("[Session] SYN frame sent for stream {}", stream_id);
 
         // 启动帧处理任务
         let session_clone = Arc::new(self.clone());
@@ -205,17 +215,22 @@ impl Session {
     async fn write_conn(&self, data: &[u8]) -> io::Result<usize> {
         let mut conn = self.conn.lock().await;
         
+        log::debug!("[Session] Writing {} bytes to connection", data.len());
+        
         // 如果正在缓冲，添加到缓冲区
         if self.buffering.load(Ordering::Acquire) {
             let mut buffer = self.buffer.lock().await;
             buffer.extend_from_slice(data);
+            log::debug!("[Session] Buffered {} bytes (total buffer size: {})", data.len(), buffer.len());
             return Ok(data.len());
         }
 
         // 处理填充
         if self.send_padding.load(Ordering::Acquire) {
+            log::debug!("[Session] Writing with padding");
             self.write_with_padding(&mut *conn, data).await
         } else {
+            log::debug!("[Session] Writing without padding");
             conn.write_all(data).await?;
             Ok(data.len())
         }
@@ -293,39 +308,53 @@ impl Session {
 
         loop {
             if self.is_closed() {
+                log::debug!("[Session] Session closed, exiting receive loop");
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed"));
             }
 
             // 读取头部
+            log::debug!("[Session] Reading frame header");
             conn.read_exact(&mut header_buf).await?;
             let header = crate::proxy::session::frame::RawHeader::from_bytes(&header_buf)?;
+            log::debug!("[Session] Received frame header: cmd={}, sid={}, length={}", 
+                       header.cmd, header.sid, header.length);
 
             // 读取数据
             let mut data = BytesMut::with_capacity(header.length as usize);
             if header.length > 0 {
                 data.resize(header.length as usize, 0);
                 conn.read_exact(&mut data).await?;
+                log::debug!("[Session] Read {} bytes of frame data", data.len());
             }
 
             // 处理帧
+            log::debug!("[Session] Processing frame: cmd={}, sid={}", header.cmd, header.sid);
             self.handle_frame(header.cmd, header.sid, data.freeze()).await?;
         }
     }
 
     /// 处理接收到的帧
     async fn handle_frame(&self, cmd: u8, sid: u32, data: Bytes) -> io::Result<()> {
+        log::debug!("[Session] Handling frame: cmd={}, sid={}, data_len={}", cmd, sid, data.len());
+        
         match cmd {
             CMD_PSH => {
                 // 数据推送 - 将数据发送到对应的 Stream
+                log::debug!("[Session] Processing PSH frame for stream {}", sid);
                 if !data.is_empty() {
+                    let data_len = data.len();
                     let streams = self.streams.read().await;
                     if let Some(stream_tx) = streams.get(&sid) {
                         if let Err(_) = stream_tx.try_send(data) {
-                            log::warn!("Failed to send data to stream {}: channel full", sid);
+                            log::warn!("[Session] Failed to send data to stream {}: channel full", sid);
+                        } else {
+                            log::debug!("[Session] Successfully sent {} bytes to stream {}", data_len, sid);
                         }
                     } else {
-                        log::warn!("Received data for unknown stream: {}", sid);
+                        log::warn!("[Session] Received data for unknown stream: {}", sid);
                     }
+                } else {
+                    log::debug!("[Session] Received empty PSH frame for stream {}", sid);
                 }
             }
             CMD_SYN => {
@@ -452,9 +481,11 @@ impl Session {
             CMD_SERVER_SETTINGS => {
                 // 服务端设置
                 if self.is_client && !data.is_empty() {
+                    log::debug!("[Session] Received server settings, processing...");
                     self.handle_server_settings(data).await?;
+                    log::debug!("[Session] Server settings processed, ready for streams");
                 } else if !self.is_client {
-                    log::warn!("Server received unexpected SERVER_SETTINGS");
+                    log::warn!("[Session] Server received unexpected SERVER_SETTINGS");
                 }
             }
             _ => {
