@@ -1,6 +1,5 @@
 use anytls_rs::proxy::padding::{DefaultPaddingFactory, PaddingFactory};
 use anytls_rs::proxy::session::Client;
-use anytls_rs::util::PROGRAM_VERSION_NAME;
 use clap::Parser;
 use log::{error, info};
 use std::sync::Arc;
@@ -11,6 +10,7 @@ use tokio_rustls::TlsConnector;
 use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
+use anytls_rs::PROGRAM_VERSION_NAME;
 
 #[derive(Parser)]
 #[command(name = "anytls-client")]

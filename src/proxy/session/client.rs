@@ -92,13 +92,8 @@ impl Client {
         // 创建 Session
         let session = Arc::new(Session::new_client(conn, self.padding.clone()));
 
-        // 启动 Session
-        let session_clone = session.clone();
-        tokio::spawn(async move {
-            if let Err(e) = session_clone.run().await {
-                log::error!("Session run error: {}", e);
-            }
-        });
+        // 启动 Session（同步等待 run 完成，run 内部会自行启动接收循环）
+        session.run().await?;
 
         Ok(session)
     }

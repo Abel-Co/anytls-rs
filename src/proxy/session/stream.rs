@@ -8,7 +8,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// Stream 实现 AsyncRead 和 AsyncWrite，提供读写缓冲区
-/// 基于参考实现，使用更简洁的设计
 pub struct Stream {
     pub id: u32,
     
@@ -47,10 +46,10 @@ impl Stream {
         }
     }
 
-    /// 获取 Stream ID
-    pub fn id(&self) -> u32 {
-        self.id
-    }
+    // /// 获取 Stream ID
+    // pub fn id(&self) -> u32 {
+    //     self.id
+    // }
 
     /// 检查是否已关闭
     pub fn is_closed(&self) -> bool {
@@ -65,27 +64,27 @@ impl Stream {
         }
     }
 
-    /// 关闭 Stream
-    pub async fn close(&self) -> io::Result<()> {
-        if self.is_closed() {
-            return Ok(());
-        }
+    // /// 关闭 Stream
+    // pub async fn close(&self) -> io::Result<()> {
+    //     if self.is_closed() {
+    //         return Ok(());
+    //     }
 
-        // 发送 FIN 帧
-        let frame = Frame::new(CMD_FIN, self.id);
-        if let Err(_) = self.frame_tx.try_send(frame) {
-            // 如果发送失败，说明 session 已经关闭
-        }
+    //     // 发送 FIN 帧
+    //     let frame = Frame::new(CMD_FIN, self.id);
+    //     if let Err(_) = self.frame_tx.try_send(frame) {
+    //         // 如果发送失败，说明 session 已经关闭
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    /// 本地关闭（不通知远程）
-    pub fn close_locally(&mut self) {
-        if !self.is_closed() {
-            self.mark_closed();
-        }
-    }
+    // /// 本地关闭（不通知远程）
+    // pub fn close_locally(&mut self) {
+    //     if !self.is_closed() {
+    //         self.mark_closed();
+    //     }
+    // }
 
     /// 分割 Stream 为读写两部分
     /// 使用 tokio::io::split 创建真正的读写分离
@@ -111,8 +110,7 @@ impl AsyncRead for Stream {
             let remaining = data.len() - self.read_offset;
             let to_copy = remaining.min(buf.remaining());
             
-            log::debug!("[Stream] Reading {} bytes from buffer for stream {} (remaining: {})", 
-                       to_copy, self.id, remaining);
+            log::debug!("[Stream] Reading {} bytes from buffer for stream {} (remaining: {})", to_copy, self.id, remaining);
             
             buf.put_slice(&data[self.read_offset..self.read_offset + to_copy]);
             

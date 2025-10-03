@@ -26,7 +26,6 @@ pub struct Session {
     is_client: bool,
     
     // 设置相关
-    settings_sent: AtomicBool,
     peer_version: AtomicU32,
     
     // 填充相关
@@ -59,7 +58,6 @@ impl Session {
             next_stream_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             is_client: true,
-            settings_sent: AtomicBool::new(false),
             peer_version: AtomicU32::new(0),
             padding,
             pkt_counter: AtomicU32::new(0),
@@ -84,7 +82,6 @@ impl Session {
             next_stream_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             is_client: false,
-            settings_sent: AtomicBool::new(false),
             peer_version: AtomicU32::new(0),
             padding,
             pkt_counter: AtomicU32::new(0),
@@ -107,18 +104,20 @@ impl Session {
             log::info!("[Session] Client settings sent");
         }
 
-        // 直接运行接收循环
-        log::debug!("[Session] Starting receive loop");
-        self.recv_loop().await
+        // 在独立异步任务中运行接收循环
+        log::debug!("[Session] Spawning receive loop task");
+        let session_clone = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = session_clone.recv_loop().await {
+                log::error!("Session receive loop error: {}", e);
+            }
+        });
+
+        Ok(())
     }
 
     /// 发送客户端设置
     async fn send_client_settings(&self) -> io::Result<()> {
-        if self.settings_sent.swap(true, Ordering::AcqRel) {
-            log::debug!("[Session] Settings already sent, skipping");
-            return Ok(());
-        }
-
         let settings = StringMap::from([
             ("v".to_string(), "2".to_string()),
             ("client".to_string(), crate::PROGRAM_VERSION_NAME.to_string()),
@@ -207,7 +206,8 @@ impl Session {
 
     /// 写入帧
     async fn write_frame(&self, frame: Frame) -> io::Result<usize> {
-        let data = frame.to_bytes();
+        let data = frame.to_bytes().to_vec();
+        log::debug!("[Session] Writing frame: {:?}, bytes: {:?}", frame, &data);
         self.write_conn(&data).await
     }
 
@@ -606,7 +606,6 @@ impl Clone for Session {
             next_stream_id: AtomicU32::new(self.next_stream_id.load(Ordering::Acquire)),
             closed: AtomicBool::new(self.closed.load(Ordering::Acquire)),
             is_client: self.is_client,
-            settings_sent: AtomicBool::new(self.settings_sent.load(Ordering::Acquire)),
             peer_version: AtomicU32::new(self.peer_version.load(Ordering::Acquire)),
             padding: self.padding.clone(),
             pkt_counter: AtomicU32::new(self.pkt_counter.load(Ordering::Acquire)),
