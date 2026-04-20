@@ -17,7 +17,7 @@ static DEFAULT_PADDING_SCHEME: &str = r#"stop=8
 #[derive(Clone)]
 pub struct PaddingFactory {
     scheme: StringMap,
-    raw_scheme: bytes::Bytes,
+    pub raw_scheme: bytes::Bytes,
     stop: u32,
     md5: String,
 }
@@ -78,10 +78,6 @@ impl PaddingFactory {
     
     pub fn md5(&self) -> &str {
         &self.md5
-    }
-    
-    pub fn raw_scheme(&self) -> &[u8] {
-        &self.raw_scheme
     }
     
     pub fn stop(&self) -> u32 {

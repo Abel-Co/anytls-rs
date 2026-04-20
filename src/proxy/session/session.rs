@@ -338,6 +338,11 @@ impl Session {
         log::debug!("[Session] Handling frame: cmd={}, sid={}, data_len={}", cmd, sid, data.len());
         
         match cmd {
+            CMD_WASTE => {
+                // 填充数据 - 完全忽略
+                // 这是填充包，不需要任何处理
+                log::debug!("[Session] Received WASTE frame for stream {}", sid);
+            }
             CMD_PSH => {
                 // 数据推送 - 将数据发送到对应的 Stream
                 log::debug!("[Session] Processing PSH frame for stream {}", sid);
@@ -418,24 +423,12 @@ impl Session {
                 }
             }
             CMD_FIN => {
-                // 流关闭
-                if self.streams.read().await.contains_key(&sid) {
-                    log::info!("Stream {} closing", sid);
-                    // 由于 Arc<Stream> 不能调用需要 &mut self 的方法
-                    // 这里需要重新设计关闭机制
-                }
-                
-                // 从 streams 中移除
-                {
-                    let mut streams = self.streams.write().await;
-                    streams.remove(&sid);
+                let mut streams = self.streams.write().await;
+                if let Some(stream_tx) = streams.remove(&sid) {
+                    drop(stream_tx);
                 }
             }
-            CMD_WASTE => {
-                // 填充数据 - 完全忽略
-                // 这是填充包，不需要任何处理
-            }
-            CMD_SETTINGS => {
+           CMD_SETTINGS => {
                 // 客户端设置
                 if !self.is_client && !data.is_empty() {
                     self.handle_client_settings(data).await?;
@@ -501,30 +494,55 @@ impl Session {
 
     /// 处理客户端设置
     async fn handle_client_settings(&self, data: Bytes) -> io::Result<()> {
+        log::debug!("[Session] handle_client_settings: received {} bytes of settings data: {:?}", data.len(), &data);
+
         let settings = StringMap::from_bytes(&data);
-        
+        log::debug!("[Session] handle_client_settings: parsed settings: {:?}", settings);
+
         // 检查填充方案
         if let Some(padding_md5) = settings.get("padding-md5") {
+            log::debug!("[Session] handle_client_settings: padding MD5 - received: {}, current: {}", padding_md5, self.padding.md5());
+
             if padding_md5 != self.padding.md5() {
-                let raw_scheme = self.padding.raw_scheme().to_vec();
+                let raw_scheme = self.padding.raw_scheme.clone();
+                log::debug!("[Session] handle_client_settings: sending padding scheme update ({} bytes)", raw_scheme.len());
+
                 let frame = Frame::with_data(CMD_UPDATE_PADDING_SCHEME, 0, Bytes::from(raw_scheme));
                 self.write_control_frame(frame).await?;
+                log::debug!("[Session] handle_client_settings: padding scheme update frame sent");
+            } else {
+                log::debug!("[Session] handle_client_settings: padding schemes match, no update needed");
             }
+        } else {
+            log::debug!("[Session] handle_client_settings: no padding-md5 found in settings");
         }
 
         // 检查客户端版本
         if let Some(version) = settings.get("v") {
             if let Ok(v) = version.parse::<u32>() {
+                let old_version = self.peer_version.load(Ordering::Acquire);
                 self.peer_version.store(v, Ordering::Release);
+                log::debug!("[Session] handle_client_settings: version updated from {} to {}", old_version, v);
+
                 if v >= 2 {
                     // 发送服务端设置
                     let server_settings = StringMap::from([("v".to_string(), "2".to_string())]);
+                    log::debug!("[Session] handle_client_settings: sending server settings: {:?}", server_settings);
+
                     let frame = Frame::with_data(CMD_SERVER_SETTINGS, 0, Bytes::from(server_settings.to_bytes()));
                     self.write_control_frame(frame).await?;
+                    log::debug!("[Session] handle_client_settings: server settings frame sent");
+                } else {
+                    log::debug!("[Session] handle_client_settings: version {} < 2, not sending server settings", v);
                 }
+            } else {
+                log::warn!("[Session] handle_client_settings: failed to parse version: '{}'", version);
             }
+        } else {
+            log::debug!("[Session] handle_client_settings: no version found in settings");
         }
 
+        log::debug!("[Session] handle_client_settings: processing completed successfully");
         Ok(())
     }
 
