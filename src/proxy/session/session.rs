@@ -229,21 +229,33 @@ impl Session {
         // 先直发业务帧，再根据策略追加 CMD_WASTE 填充帧。
         conn.write_all(data).await?;
 
+        // 按策略逐段“消费”本次业务数据，剩余部分用 CMD_WASTE 补齐。
+        // 注意：这里不会切分业务帧，只做额外填充帧，优先保证协议互通。
         let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
-        let target_size = pkt_sizes
-            .into_iter()
-            .find(|s| *s != crate::proxy::padding::CHECK_MARK)
-            .map(|s| s as usize)
-            .unwrap_or(0);
+        let mut payload_remaining = data.len();
+        for size in pkt_sizes {
+            if size == crate::proxy::padding::CHECK_MARK {
+                // c: 若业务数据已耗尽，则本次 Write 提前结束
+                if payload_remaining == 0 {
+                    break;
+                }
+                continue;
+            }
 
-        if target_size > data.len() + HEADER_OVERHEAD_SIZE {
-            let waste_payload_len = target_size - data.len() - HEADER_OVERHEAD_SIZE;
-            let mut waste = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + waste_payload_len);
-            waste.put_u8(CMD_WASTE);
-            waste.put_u32(0);
-            waste.put_u16(waste_payload_len as u16);
-            waste.extend_from_slice(&self.padding.rng_vec(waste_payload_len));
-            conn.write_all(&waste).await?;
+            let target_payload = size as usize;
+            let consumed = payload_remaining.min(target_payload);
+            payload_remaining -= consumed;
+
+            // 该段目标比业务消耗更多时，用 WASTE 补齐差值
+            if target_payload > consumed + HEADER_OVERHEAD_SIZE {
+                let waste_payload_len = target_payload - consumed - HEADER_OVERHEAD_SIZE;
+                let mut waste = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + waste_payload_len);
+                waste.put_u8(CMD_WASTE);
+                waste.put_u32(0);
+                waste.put_u16(waste_payload_len as u16);
+                waste.extend_from_slice(&self.padding.rng_vec(waste_payload_len));
+                conn.write_all(&waste).await?;
+            }
         }
 
         Ok(data.len())
