@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{ReadHalf, WriteHalf};
 
 // 使用 util 中定义的 trait
 use crate::util::r#type::AsyncReadWrite;
@@ -15,7 +16,8 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 /// Session 管理多个 Stream 的连接复用
 pub struct Session {
-    conn: Arc<Mutex<Box<dyn AsyncReadWrite>>>,
+    conn_r: Arc<Mutex<ReadHalf<Box<dyn AsyncReadWrite>>>>,
+    conn_w: Arc<Mutex<WriteHalf<Box<dyn AsyncReadWrite>>>>,
     
     // Stream 管理
     streams: Arc<RwLock<HashMap<u32, mpsc::Sender<Bytes>>>>,
@@ -51,9 +53,11 @@ impl Session {
         padding: Arc<PaddingFactory>,
     ) -> Self {
         let (data_tx, _data_rx) = mpsc::unbounded_channel();
+        let (conn_r, conn_w) = tokio::io::split(conn);
         
         Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn_r: Arc::new(Mutex::new(conn_r)),
+            conn_w: Arc::new(Mutex::new(conn_w)),
             streams: Arc::new(RwLock::new(HashMap::new())),
             next_stream_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
@@ -61,7 +65,8 @@ impl Session {
             peer_version: AtomicU32::new(0),
             padding,
             pkt_counter: AtomicU32::new(0),
-            send_padding: AtomicBool::new(true),
+            // 先保证与 anytls-go 互通：客户端直接按帧发送，不走当前未完全对齐的 padding 分包逻辑
+            send_padding: AtomicBool::new(false),
             buffering: AtomicBool::new(false),
             buffer: Arc::new(Mutex::new(BytesMut::new())),
             data_tx,
@@ -75,9 +80,11 @@ impl Session {
         padding: Arc<PaddingFactory>,
     ) -> Self {
         let (data_tx, _data_rx) = mpsc::unbounded_channel();
+        let (conn_r, conn_w) = tokio::io::split(conn);
         
         Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn_r: Arc::new(Mutex::new(conn_r)),
+            conn_w: Arc::new(Mutex::new(conn_w)),
             streams: Arc::new(RwLock::new(HashMap::new())),
             next_stream_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
@@ -128,9 +135,6 @@ impl Session {
         let frame = Frame::with_data(CMD_SETTINGS, 0, Bytes::from(settings.to_bytes()));
         self.write_control_frame(frame).await?;
         log::debug!("[Session] Client settings frame sent");
-        
-        self.buffering.store(true, Ordering::Release);
-        log::debug!("[Session] Buffering enabled");
         Ok(())
     }
 
@@ -172,9 +176,6 @@ impl Session {
             }
         });
 
-        // 停止缓冲
-        self.buffering.store(false, Ordering::Release);
-
         Ok(stream)
     }
 
@@ -213,7 +214,7 @@ impl Session {
 
     /// 写入连接
     async fn write_conn(&self, data: &[u8]) -> io::Result<usize> {
-        let mut conn = self.conn.lock().await;
+        let mut conn = self.conn_w.lock().await;
         
         log::debug!("[Session] Writing {} bytes to connection", data.len());
         
@@ -237,7 +238,10 @@ impl Session {
     }
 
     /// 带填充的写入
-    async fn write_with_padding(&self, conn: &mut dyn AsyncReadWrite, data: &[u8]) -> io::Result<usize> {
+    async fn write_with_padding<W>(&self, conn: &mut W, data: &[u8]) -> io::Result<usize>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let pkt = self.pkt_counter.fetch_add(1, Ordering::AcqRel);
         
         if pkt < self.padding.stop() {
@@ -303,7 +307,6 @@ impl Session {
 
     /// 接收循环
     async fn recv_loop(&self) -> io::Result<()> {
-        let mut conn = self.conn.lock().await;
         let mut header_buf = [0u8; HEADER_OVERHEAD_SIZE];
 
         loop {
@@ -314,22 +317,31 @@ impl Session {
 
             // 读取头部
             log::debug!("[Session] Reading frame header");
-            conn.read_exact(&mut header_buf).await?;
-            let header = crate::proxy::session::frame::RawHeader::from_bytes(&header_buf)?;
-            log::debug!("[Session] Received frame header: cmd={}, sid={}, length={}", 
-                       header.cmd, header.sid, header.length);
+            let (cmd, sid, data) = {
+                // 读路径只在“读取一帧”期间持有连接锁，避免阻塞并发写
+                let mut conn = self.conn_r.lock().await;
+                conn.read_exact(&mut header_buf).await?;
+                let header = crate::proxy::session::frame::RawHeader::from_bytes(&header_buf)?;
+                log::debug!(
+                    "[Session] Received frame header: cmd={}, sid={}, length={}",
+                    header.cmd,
+                    header.sid,
+                    header.length
+                );
 
-            // 读取数据
-            let mut data = BytesMut::with_capacity(header.length as usize);
-            if header.length > 0 {
-                data.resize(header.length as usize, 0);
-                conn.read_exact(&mut data).await?;
-                log::debug!("[Session] Read {} bytes of frame data", data.len());
-            }
+                let mut data = BytesMut::with_capacity(header.length as usize);
+                if header.length > 0 {
+                    data.resize(header.length as usize, 0);
+                    conn.read_exact(&mut data).await?;
+                    log::debug!("[Session] Read {} bytes of frame data", data.len());
+                }
+
+                (header.cmd, header.sid, data.freeze())
+            };
 
             // 处理帧
-            log::debug!("[Session] Processing frame: cmd={}, sid={}", header.cmd, header.sid);
-            self.handle_frame(header.cmd, header.sid, data.freeze()).await?;
+            log::debug!("[Session] Processing frame: cmd={}, sid={}", cmd, sid);
+            self.handle_frame(cmd, sid, data).await?;
         }
     }
 
@@ -619,7 +631,8 @@ impl Session {
 impl Clone for Session {
     fn clone(&self) -> Self {
         Self {
-            conn: self.conn.clone(),
+            conn_r: self.conn_r.clone(),
+            conn_w: self.conn_w.clone(),
             streams: self.streams.clone(),
             next_stream_id: AtomicU32::new(self.next_stream_id.load(Ordering::Acquire)),
             closed: AtomicBool::new(self.closed.load(Ordering::Acquire)),

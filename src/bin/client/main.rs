@@ -11,6 +11,7 @@ use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use anytls_rs::PROGRAM_VERSION_NAME;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Parser)]
 #[command(name = "anytls-client")]
@@ -174,8 +175,20 @@ async fn handle_client_connection(
     
     // 创建 AnyTLS 流
     log::debug!("[Client] Creating AnyTLS stream");
-    let anytls_stream = client.create_stream().await?;
+    let mut anytls_stream = client.create_stream().await?;
     log::info!("[Client] AnyTLS stream created successfully");
+
+    // 按协议要求，Stream 建立后首先发送目标地址（SocksAddr）
+    // 服务端收到后才会发起真实出站连接。
+    let target_socks_addr = build_socks_addr(addr_type, &target_addr, port)?;
+    anytls_stream.write_all(&target_socks_addr).await?;
+    anytls_stream.flush().await?;
+    log::debug!(
+        "[Client] Sent SocksAddr to server: {}:{} ({} bytes)",
+        target_addr,
+        port,
+        target_socks_addr.len()
+    );
     
     // 发送连接成功响应
     let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -217,6 +230,45 @@ async fn handle_client_connection(
     // 在实际使用中，应该根据业务逻辑来决定是否复用 Session
     
     Ok(())
+}
+
+fn build_socks_addr(addr_type: u8, target_addr: &str, port: u16) -> Result<Vec<u8>, std::io::Error> {
+    let mut out = Vec::with_capacity(32);
+    match addr_type {
+        0x01 => {
+            out.push(0x01);
+            let ip: Ipv4Addr = target_addr.parse().map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IPv4 address: {e}"))
+            })?;
+            out.extend_from_slice(&ip.octets());
+        }
+        0x03 => {
+            out.push(0x03);
+            if target_addr.len() > u8::MAX as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "domain is too long for SOCKS5",
+                ));
+            }
+            out.push(target_addr.len() as u8);
+            out.extend_from_slice(target_addr.as_bytes());
+        }
+        0x04 => {
+            out.push(0x04);
+            let ip: Ipv6Addr = target_addr.parse().map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IPv6 address: {e}"))
+            })?;
+            out.extend_from_slice(&ip.octets());
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsupported address type",
+            ));
+        }
+    }
+    out.extend_from_slice(&port.to_be_bytes());
+    Ok(out)
 }
 
 fn create_dial_out_func(
