@@ -41,6 +41,7 @@ impl Session {
     pub fn new_client(
         conn: Box<dyn AsyncReadWrite>,
         padding: Arc<PaddingFactory>,
+        enable_padding: bool,
     ) -> Self {
         let (conn_r, conn_w) = tokio::io::split(conn);
         
@@ -54,8 +55,7 @@ impl Session {
             peer_version: AtomicU32::new(0),
             padding,
             pkt_counter: AtomicU32::new(0),
-            // 先保证与 anytls-go 互通：客户端直接按帧发送，不走当前未完全对齐的 padding 分包逻辑
-            send_padding: AtomicBool::new(false),
+            send_padding: AtomicBool::new(enable_padding),
         }
     }
 
@@ -113,7 +113,11 @@ impl Session {
 
         log::debug!("[Session] Client settings: {:?}", settings);
         let frame = Frame::with_data(CMD_SETTINGS, 0, Bytes::from(settings.to_bytes()));
-        self.write_control_frame(frame).await?;
+        let data = frame.to_bytes();
+        // 协议要求：新会话必须“立即发送” cmdSettings。
+        // 即使开启 padding，这里也直写，避免被分包/延后。
+        let mut conn = self.conn_w.lock().await;
+        conn.write_all(&data).await?;
         log::debug!("[Session] Client settings frame sent");
         Ok(())
     }
@@ -215,66 +219,34 @@ impl Session {
         W: AsyncWrite + Unpin,
     {
         let pkt = self.pkt_counter.fetch_add(1, Ordering::AcqRel);
-        
-        if pkt < self.padding.stop() {
-            let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
-            let mut remaining = data;
-            let mut total_written = 0;
-
-            for size in pkt_sizes {
-                if size == crate::proxy::padding::CHECK_MARK {
-                    if remaining.is_empty() {
-                        break;
-                    } else {
-                        continue;
-                    }
-                }
-
-                let size = size as usize;
-                if remaining.len() > size {
-                    // 这个包全是有效载荷
-                    conn.write_all(&remaining[..size]).await?;
-                    total_written += size;
-                    remaining = &remaining[size..];
-                } else if !remaining.is_empty() {
-                    // 这个包包含填充和有效载荷的最后部分
-                    let padding_len = size.saturating_sub(remaining.len() + HEADER_OVERHEAD_SIZE);
-                    if padding_len > 0 {
-                        let mut packet = BytesMut::with_capacity(size);
-                        packet.put_u8(CMD_WASTE);
-                        packet.put_u32(0);
-                        packet.put_u16(padding_len as u16);
-                        packet.extend_from_slice(remaining);
-                        packet.extend_from_slice(&self.padding.rng_vec(padding_len));
-                        conn.write_all(&packet).await?;
-                    } else {
-                        conn.write_all(remaining).await?;
-                    }
-                    total_written += remaining.len();
-                    remaining = &[];
-                } else {
-                    // 这个包全是填充
-                    let mut packet = BytesMut::with_capacity(size);
-                    packet.put_u8(CMD_WASTE);
-                    packet.put_u32(0);
-                    packet.put_u16((size - HEADER_OVERHEAD_SIZE) as u16);
-                    packet.extend_from_slice(&self.padding.rng_vec(size - HEADER_OVERHEAD_SIZE));
-                    conn.write_all(&packet).await?;
-                }
-            }
-
-            // 可能还有剩余的有效载荷要写入
-            if !remaining.is_empty() {
-                conn.write_all(remaining).await?;
-                total_written += remaining.len();
-            }
-
-            Ok(total_written)
-        } else {
+        if pkt >= self.padding.stop() {
             self.send_padding.store(false, Ordering::Release);
             conn.write_all(data).await?;
-            Ok(data.len())
+            return Ok(data.len());
         }
+
+        // 兼容优先：业务帧必须保持完整，不对 AnyTLS 帧做字节级切分。
+        // 先直发业务帧，再根据策略追加 CMD_WASTE 填充帧。
+        conn.write_all(data).await?;
+
+        let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
+        let target_size = pkt_sizes
+            .into_iter()
+            .find(|s| *s != crate::proxy::padding::CHECK_MARK)
+            .map(|s| s as usize)
+            .unwrap_or(0);
+
+        if target_size > data.len() + HEADER_OVERHEAD_SIZE {
+            let waste_payload_len = target_size - data.len() - HEADER_OVERHEAD_SIZE;
+            let mut waste = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + waste_payload_len);
+            waste.put_u8(CMD_WASTE);
+            waste.put_u32(0);
+            waste.put_u16(waste_payload_len as u16);
+            waste.extend_from_slice(&self.padding.rng_vec(waste_payload_len));
+            conn.write_all(&waste).await?;
+        }
+
+        Ok(data.len())
     }
 
     /// 接收循环
