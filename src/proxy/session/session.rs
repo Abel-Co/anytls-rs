@@ -5,9 +5,9 @@ use crate::util::string_map::{StringMap, StringMapExt};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::io::{ReadHalf, WriteHalf};
 
 // 使用 util 中定义的 trait
@@ -34,16 +34,6 @@ pub struct Session {
     padding: Arc<PaddingFactory>,
     pkt_counter: AtomicU32,
     send_padding: AtomicBool,
-    
-    // 缓冲相关
-    buffering: AtomicBool,
-    buffer: Arc<Mutex<BytesMut>>,
-    
-    // 数据通道
-    data_tx: mpsc::UnboundedSender<(u32, Bytes)>,
-    
-    // Session ID
-    session_id: AtomicU64,
 }
 
 impl Session {
@@ -52,7 +42,6 @@ impl Session {
         conn: Box<dyn AsyncReadWrite>,
         padding: Arc<PaddingFactory>,
     ) -> Self {
-        let (data_tx, _data_rx) = mpsc::unbounded_channel();
         let (conn_r, conn_w) = tokio::io::split(conn);
         
         Self {
@@ -67,10 +56,6 @@ impl Session {
             pkt_counter: AtomicU32::new(0),
             // 先保证与 anytls-go 互通：客户端直接按帧发送，不走当前未完全对齐的 padding 分包逻辑
             send_padding: AtomicBool::new(false),
-            buffering: AtomicBool::new(false),
-            buffer: Arc::new(Mutex::new(BytesMut::new())),
-            data_tx,
-            session_id: AtomicU64::new(0),
         }
     }
 
@@ -79,7 +64,6 @@ impl Session {
         conn: Box<dyn AsyncReadWrite>,
         padding: Arc<PaddingFactory>,
     ) -> Self {
-        let (data_tx, _data_rx) = mpsc::unbounded_channel();
         let (conn_r, conn_w) = tokio::io::split(conn);
         
         Self {
@@ -93,10 +77,6 @@ impl Session {
             padding,
             pkt_counter: AtomicU32::new(0),
             send_padding: AtomicBool::new(false),
-            buffering: AtomicBool::new(false),
-            buffer: Arc::new(Mutex::new(BytesMut::new())),
-            data_tx,
-            session_id: AtomicU64::new(0),
         }
     }
 
@@ -217,14 +197,6 @@ impl Session {
         let mut conn = self.conn_w.lock().await;
         
         log::debug!("[Session] Writing {} bytes to connection", data.len());
-        
-        // 如果正在缓冲，添加到缓冲区
-        if self.buffering.load(Ordering::Acquire) {
-            let mut buffer = self.buffer.lock().await;
-            buffer.extend_from_slice(data);
-            log::debug!("[Session] Buffered {} bytes (total buffer size: {})", data.len(), buffer.len());
-            return Ok(data.len());
-        }
 
         // 处理填充
         if self.send_padding.load(Ordering::Acquire) {
@@ -641,10 +613,6 @@ impl Clone for Session {
             padding: self.padding.clone(),
             pkt_counter: AtomicU32::new(self.pkt_counter.load(Ordering::Acquire)),
             send_padding: AtomicBool::new(self.send_padding.load(Ordering::Acquire)),
-            buffering: AtomicBool::new(self.buffering.load(Ordering::Acquire)),
-            buffer: self.buffer.clone(),
-            data_tx: self.data_tx.clone(),
-            session_id: AtomicU64::new(self.session_id.load(Ordering::Acquire)),
         }
     }
 }
