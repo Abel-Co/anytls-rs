@@ -54,7 +54,7 @@ impl Client {
     }
 
     /// 创建新的 Stream
-    pub async fn create_stream(&self) -> io::Result<Stream> {
+    pub async fn create_stream(&self) -> io::Result<(Arc<Session>, Stream)> {
         if self.closed.load(Ordering::Acquire) {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Client closed"));
         }
@@ -62,14 +62,16 @@ impl Client {
         // 尝试获取空闲的 Session
         if let Some(session) = self.get_idle_session().await {
             log::debug!("Reusing idle session");
-            return session.open_stream().await;
+            let stream = session.open_stream().await?;
+            return Ok((session, stream));
         }
 
         // 创建新的 Session
         let session = self.create_session().await?;
         log::debug!("Created new session");
-        
-        session.open_stream().await
+
+        let stream = session.open_stream().await?;
+        Ok((session, stream))
     }
 
     /// 手动将 Session 放回空闲池（由外部调用）
@@ -84,7 +86,7 @@ impl Client {
         // 直接返回第一个可用的 Session
         // 注意：这里没有过期检查，因为 VecDeque 设计更简单
         // 如果需要过期检查，可以考虑在 Session 内部添加时间戳
-        idle_sessions.pop_front()
+        idle_sessions.pop_back()
     }
 
     /// 创建新的 Session

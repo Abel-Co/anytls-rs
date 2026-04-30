@@ -180,7 +180,7 @@ async fn handle_client_connection(
     
     // 创建 AnyTLS 流
     log::debug!("[Client] Creating AnyTLS stream");
-    let mut anytls_stream = client.create_stream().await?;
+    let (session, mut anytls_stream) = client.create_stream().await?;
     log::info!("[Client] AnyTLS stream created successfully");
 
     // 按协议要求，Stream 建立后首先发送目标地址（SocksAddr）
@@ -229,11 +229,11 @@ async fn handle_client_connection(
     
     // 等待两个任务都完成
     tokio::join!(client_to_target, target_to_client);
-    
-    // 注意：这里我们没有显式地将 Session 放回空闲池
-    // 因为当前的架构中，每个连接都创建新的 Stream
-    // 在实际使用中，应该根据业务逻辑来决定是否复用 Session
-    
+
+    if !session.is_closed() {
+        client.return_session_to_idle(session).await;
+    }
+
     Ok(())
 }
 
