@@ -1,7 +1,7 @@
 use anytls_rs::proxy::padding::{DefaultPaddingFactory, PaddingFactory};
 use anytls_rs::proxy::session::Client;
 use clap::Parser;
-use log::{error, info};
+use log::{debug, error, info};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use bytes::{BufMut, BytesMut};
@@ -208,7 +208,7 @@ async fn handle_client_connection(
     let client_to_target = async move {
         match tokio::io::copy(&mut client_read, &mut anytls_write).await {
             Ok(bytes) => {
-                info!("[Client] Client to target copy completed: {} bytes", bytes);
+                debug!("[Client] Client to target copy completed: {} bytes", bytes);
             }
             Err(e) => {
                 error!("[Client] Client to target copy error: {}", e);
@@ -219,7 +219,7 @@ async fn handle_client_connection(
     let target_to_client = async move {
         match tokio::io::copy(&mut anytls_read, &mut client_write).await {
             Ok(bytes) => {
-                info!("[Client] Target to client copy completed: {} bytes", bytes);
+                debug!("[Client] Target to client copy completed: {} bytes", bytes);
             }
             Err(e) => {
                 error!("[Client] Target to client copy error: {}", e);

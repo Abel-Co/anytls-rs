@@ -34,6 +34,10 @@ pub struct Session {
     padding: Arc<PaddingFactory>,
     pkt_counter: AtomicU32,
     send_padding: AtomicBool,
+
+    // 每个 Session 单独 writer 队列
+    frame_tx: mpsc::Sender<Frame>,
+    frame_rx: Arc<Mutex<Option<mpsc::Receiver<Frame>>>>,
 }
 
 impl Session {
@@ -44,6 +48,7 @@ impl Session {
         enable_padding: bool,
     ) -> Self {
         let (conn_r, conn_w) = tokio::io::split(conn);
+        let (frame_tx, frame_rx) = mpsc::channel(1024);
         
         Self {
             conn_r: Arc::new(Mutex::new(conn_r)),
@@ -56,6 +61,8 @@ impl Session {
             padding,
             pkt_counter: AtomicU32::new(0),
             send_padding: AtomicBool::new(enable_padding),
+            frame_tx,
+            frame_rx: Arc::new(Mutex::new(Some(frame_rx))),
         }
     }
 
@@ -65,6 +72,7 @@ impl Session {
         padding: Arc<PaddingFactory>,
     ) -> Self {
         let (conn_r, conn_w) = tokio::io::split(conn);
+        let (frame_tx, frame_rx) = mpsc::channel(1024);
         
         Self {
             conn_r: Arc::new(Mutex::new(conn_r)),
@@ -77,6 +85,8 @@ impl Session {
             padding,
             pkt_counter: AtomicU32::new(0),
             send_padding: AtomicBool::new(false),
+            frame_tx,
+            frame_rx: Arc::new(Mutex::new(Some(frame_rx))),
         }
     }
 
@@ -90,6 +100,23 @@ impl Session {
             self.send_client_settings().await?;
             log::info!("[Session] Client settings sent");
         }
+
+        // 启动每个 Session 独立 writer loop
+        let mut writer_rx = self
+            .frame_rx
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer loop already started"))?;
+        let writer_session = self.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = writer_rx.recv().await {
+                if let Err(e) = writer_session.write_frame(frame).await {
+                    log::error!("Session writer loop error: {}", e);
+                    break;
+                }
+            }
+        });
 
         // 在独立异步任务中运行接收循环
         log::debug!("[Session] Spawning receive loop task");
@@ -132,11 +159,10 @@ impl Session {
         
         // 创建数据通道
         let (data_tx, data_rx) = mpsc::channel(100);
-        let (frame_tx, mut frame_rx) = mpsc::channel(100);
         let (close_tx, _close_rx) = oneshot::channel();
         
         // 创建 Stream
-        let stream = Stream::new(stream_id, data_rx, frame_tx, close_tx);
+        let stream = Stream::new(stream_id, data_rx, self.frame_tx.clone(), close_tx);
 
         // 注册 Stream 到 Session
         {
@@ -148,17 +174,6 @@ impl Session {
         let frame = Frame::new(CMD_SYN, stream_id);
         self.write_control_frame(frame).await?;
         log::debug!("[Session] SYN frame sent for stream {}", stream_id);
-
-        // 启动帧处理任务
-        let session_clone = Arc::new(self.clone());
-        tokio::spawn(async move {
-            while let Some(frame) = frame_rx.recv().await {
-                if let Err(e) = session_clone.write_frame(frame).await {
-                    log::error!("Failed to write frame: {}", e);
-                    break;
-                }
-            }
-        });
 
         Ok(stream)
     }
@@ -181,12 +196,21 @@ impl Session {
     /// 写入数据帧
     pub async fn write_data_frame(&self, stream_id: u32, data: &[u8]) -> io::Result<usize> {
         let frame = Frame::with_data(CMD_PSH, stream_id, Bytes::copy_from_slice(data));
-        self.write_frame(frame).await
+        self.frame_tx
+            .send(frame)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session writer closed"))?;
+        Ok(data.len() + HEADER_OVERHEAD_SIZE)
     }
 
     /// 写入控制帧
     async fn write_control_frame(&self, frame: Frame) -> io::Result<usize> {
-        self.write_frame(frame).await
+        let n = frame.data.len();
+        self.frame_tx
+            .send(frame)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session writer closed"))?;
+        Ok(n + HEADER_OVERHEAD_SIZE)
     }
 
     /// 写入帧
@@ -597,6 +621,8 @@ impl Clone for Session {
             padding: self.padding.clone(),
             pkt_counter: AtomicU32::new(self.pkt_counter.load(Ordering::Acquire)),
             send_padding: AtomicBool::new(self.send_padding.load(Ordering::Acquire)),
+            frame_tx: self.frame_tx.clone(),
+            frame_rx: self.frame_rx.clone(),
         }
     }
 }
