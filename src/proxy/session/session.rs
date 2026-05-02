@@ -39,6 +39,9 @@ pub struct Session {
     frame_tx: mpsc::Sender<Frame>,
     frame_rx: Mutex<Option<mpsc::Receiver<Frame>>>,
     close_notify: Notify,
+
+    // 服务端：新流回调
+    on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
 }
 
 impl Session {
@@ -64,12 +67,14 @@ impl Session {
             frame_tx,
             frame_rx: Mutex::new(Some(frame_rx)),
             close_notify: Notify::new(),
+            on_new_stream: None,
         }
     }
 
     /// 创建服务端 Session
     pub fn new_server(
         conn: Box<dyn AsyncReadWrite>,
+        on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
         padding: Arc<PaddingFactory>,
     ) -> Self {
         let (conn_r, conn_w) = tokio::io::split(conn);
@@ -89,6 +94,7 @@ impl Session {
             frame_tx,
             frame_rx: Mutex::new(Some(frame_rx)),
             close_notify: Notify::new(),
+            on_new_stream,
         }
     }
 
@@ -391,9 +397,8 @@ impl Session {
                     } else {
                         // 创建新的 Stream
                         let (data_tx, data_rx) = mpsc::channel(100);
-                        let (frame_tx, _frame_rx) = mpsc::channel(100);
                         let (close_tx, _close_rx) = oneshot::channel();
-                        let _stream = Stream::new(sid, data_rx, frame_tx, close_tx);
+                        let stream = Stream::new(sid, data_rx, self.frame_tx.clone(), close_tx);
                         
                         // 注册 Stream 到 Session
                         {
@@ -410,6 +415,9 @@ impl Session {
                             streams.remove(&sid);
                         } else {
                             log::info!("Stream {} opened successfully", sid);
+                            if let Some(cb) = &self.on_new_stream {
+                                cb(stream);
+                            }
                         }
                     }
                 } else {
