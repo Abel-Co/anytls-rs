@@ -136,10 +136,40 @@ impl Client {
                     break;
                 }
                 
+                client.ensure_min_idle_sessions().await;
                 client.cleanup_idle_sessions().await;
                 log::debug!("Performed idle session cleanup");
             }
         });
+    }
+
+    /// 主动预热：保持至少 min_idle_sessions 个空闲会话
+    async fn ensure_min_idle_sessions(&self) {
+        if self.min_idle_sessions == 0 || self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let need = {
+            let idle_sessions = self.idle_sessions.lock().await;
+            self.min_idle_sessions.saturating_sub(idle_sessions.len())
+        };
+
+        if need == 0 {
+            return;
+        }
+
+        for _ in 0..need {
+            if self.closed.load(Ordering::Acquire) {
+                break;
+            }
+            match self.create_session().await {
+                Ok(session) => self.return_to_idle(session).await,
+                Err(e) => {
+                    log::debug!("Prewarm session failed: {}", e);
+                    break;
+                }
+            }
+        }
     }
 
     /// 清理空闲的 Session
