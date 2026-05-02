@@ -46,7 +46,6 @@ impl Session {
     pub fn new_client(
         conn: Box<dyn AsyncReadWrite>,
         padding: Arc<PaddingFactory>,
-        enable_padding: bool,
     ) -> Self {
         let (conn_r, conn_w) = tokio::io::split(conn);
         let (frame_tx, frame_rx) = mpsc::channel(1024);
@@ -61,7 +60,7 @@ impl Session {
             peer_version: AtomicU32::new(0),
             padding,
             pkt_counter: AtomicU32::new(0),
-            send_padding: AtomicBool::new(enable_padding),
+            send_padding: AtomicBool::new(true),
             frame_tx,
             frame_rx: Mutex::new(Some(frame_rx)),
             close_notify: Notify::new(),

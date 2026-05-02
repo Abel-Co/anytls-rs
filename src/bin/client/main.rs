@@ -23,9 +23,6 @@ struct Args {
     
     #[arg(short = 'p', long, help = "Password")]
     password: String,
-
-    #[arg(long, default_value_t = false, help = "Enable session frame padding (experimental for anytls-go interop)")]
-    enable_padding: bool,
 }
 
 #[tokio::main]
@@ -43,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     info!("[Client] {}", PROGRAM_VERSION_NAME);
     info!("[Client] SOCKS5 {} => {}", args.listen, args.server);
-    info!("[Client] Session padding enabled: {}", args.enable_padding);
+    info!("[Client] Session padding enabled: true");
     
     let listener = TcpListener::bind(&args.listen).await?;
     
@@ -63,7 +60,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         padding,
         Duration::from_secs(30), // 空闲超时
         1, // 最小空闲连接数
-        args.enable_padding,
     );
     
     info!("[Client] Listening on {}", args.listen);

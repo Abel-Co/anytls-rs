@@ -22,7 +22,6 @@ pub struct Client {
     // 配置
     idle_timeout: Duration,
     min_idle_sessions: usize,
-    enable_padding: bool,
     
     // 状态
     closed: AtomicBool,
@@ -35,7 +34,6 @@ impl Client {
         padding: Arc<PaddingFactory>,
         idle_timeout: Duration,
         min_idle_sessions: usize,
-        enable_padding: bool,
     ) -> Self {
         let client = Self {
             dial_out,
@@ -43,7 +41,6 @@ impl Client {
             idle_sessions: Arc::new(Mutex::new(VecDeque::new())),
             idle_timeout,
             min_idle_sessions,
-            enable_padding,
             closed: AtomicBool::new(false),
         };
         
@@ -98,7 +95,6 @@ impl Client {
         let session = Arc::new(Session::new_client(
             conn,
             self.padding.clone(),
-            self.enable_padding,
         ));
 
         // 启动 Session（同步等待 run 完成，run 内部会自行启动接收循环）
@@ -185,7 +181,6 @@ impl Clone for Client {
             idle_sessions: self.idle_sessions.clone(),
             idle_timeout: self.idle_timeout,
             min_idle_sessions: self.min_idle_sessions,
-            enable_padding: self.enable_padding,
             closed: AtomicBool::new(self.closed.load(Ordering::Acquire)),
         }
     }
