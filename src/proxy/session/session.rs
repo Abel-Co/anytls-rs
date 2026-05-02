@@ -12,12 +12,12 @@ use tokio::io::{ReadHalf, WriteHalf};
 
 // 使用 util 中定义的 trait
 use crate::util::r#type::AsyncReadWrite;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 
 /// Session 管理多个 Stream 的连接复用
 pub struct Session {
-    conn_r: Arc<Mutex<ReadHalf<Box<dyn AsyncReadWrite>>>>,
-    conn_w: Arc<Mutex<WriteHalf<Box<dyn AsyncReadWrite>>>>,
+    conn_r: Mutex<Option<ReadHalf<Box<dyn AsyncReadWrite>>>>,
+    conn_w: Mutex<Option<WriteHalf<Box<dyn AsyncReadWrite>>>>,
     
     // Stream 管理
     streams: Arc<RwLock<HashMap<u32, mpsc::Sender<Bytes>>>>,
@@ -37,7 +37,8 @@ pub struct Session {
 
     // 每个 Session 单独 writer 队列
     frame_tx: mpsc::Sender<Frame>,
-    frame_rx: Arc<Mutex<Option<mpsc::Receiver<Frame>>>>,
+    frame_rx: Mutex<Option<mpsc::Receiver<Frame>>>,
+    close_notify: Notify,
 }
 
 impl Session {
@@ -51,8 +52,8 @@ impl Session {
         let (frame_tx, frame_rx) = mpsc::channel(1024);
         
         Self {
-            conn_r: Arc::new(Mutex::new(conn_r)),
-            conn_w: Arc::new(Mutex::new(conn_w)),
+            conn_r: Mutex::new(Some(conn_r)),
+            conn_w: Mutex::new(Some(conn_w)),
             streams: Arc::new(RwLock::new(HashMap::new())),
             next_stream_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
@@ -62,7 +63,8 @@ impl Session {
             pkt_counter: AtomicU32::new(0),
             send_padding: AtomicBool::new(enable_padding),
             frame_tx,
-            frame_rx: Arc::new(Mutex::new(Some(frame_rx))),
+            frame_rx: Mutex::new(Some(frame_rx)),
+            close_notify: Notify::new(),
         }
     }
 
@@ -75,8 +77,8 @@ impl Session {
         let (frame_tx, frame_rx) = mpsc::channel(1024);
         
         Self {
-            conn_r: Arc::new(Mutex::new(conn_r)),
-            conn_w: Arc::new(Mutex::new(conn_w)),
+            conn_r: Mutex::new(Some(conn_r)),
+            conn_w: Mutex::new(Some(conn_w)),
             streams: Arc::new(RwLock::new(HashMap::new())),
             next_stream_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
@@ -86,12 +88,13 @@ impl Session {
             pkt_counter: AtomicU32::new(0),
             send_padding: AtomicBool::new(false),
             frame_tx,
-            frame_rx: Arc::new(Mutex::new(Some(frame_rx))),
+            frame_rx: Mutex::new(Some(frame_rx)),
+            close_notify: Notify::new(),
         }
     }
 
     /// 启动 Session
-    pub async fn run(&self) -> io::Result<()> {
+    pub async fn run(self: &Arc<Self>) -> io::Result<()> {
         log::info!("[Session] Starting session (client: {})", self.is_client);
         
         if self.is_client {
@@ -108,19 +111,31 @@ impl Session {
             .await
             .take()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer loop already started"))?;
-        let writer_session = self.clone();
+        let writer_session = Arc::clone(self);
         tokio::spawn(async move {
-            while let Some(frame) = writer_rx.recv().await {
-                if let Err(e) = writer_session.write_frame(frame).await {
-                    log::error!("Session writer loop error: {}", e);
-                    break;
+            loop {
+                tokio::select! {
+                    _ = writer_session.close_notify.notified() => {
+                        break;
+                    }
+                    maybe_frame = writer_rx.recv() => {
+                        match maybe_frame {
+                            Some(frame) => {
+                                if let Err(e) = writer_session.write_frame(frame).await {
+                                    log::error!("Session writer loop error: {}", e);
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
                 }
             }
         });
 
         // 在独立异步任务中运行接收循环
         log::debug!("[Session] Spawning receive loop task");
-        let session_clone = self.clone();
+        let session_clone = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(e) = session_clone.recv_loop().await {
                 log::error!("Session receive loop error: {}", e);
@@ -143,7 +158,10 @@ impl Session {
         let data = frame.to_bytes();
         // 协议要求：新会话必须“立即发送” cmdSettings。
         // 即使开启 padding，这里也直写，避免被分包/延后。
-        let mut conn = self.conn_w.lock().await;
+        let mut conn_guard = self.conn_w.lock().await;
+        let conn = conn_guard
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed"))?;
         conn.write_all(&data).await?;
         log::debug!("[Session] Client settings frame sent");
         Ok(())
@@ -222,14 +240,17 @@ impl Session {
 
     /// 写入连接
     async fn write_conn(&self, data: &[u8]) -> io::Result<usize> {
-        let mut conn = self.conn_w.lock().await;
+        let mut conn_guard = self.conn_w.lock().await;
+        let conn = conn_guard
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed"))?;
         
         log::debug!("[Session] Writing {} bytes to connection", data.len());
 
         // 处理填充
         if self.send_padding.load(Ordering::Acquire) {
             log::debug!("[Session] Writing with padding");
-            self.write_with_padding(&mut *conn, data).await
+            self.write_with_padding(conn, data).await
         } else {
             log::debug!("[Session] Writing without padding");
             conn.write_all(data).await?;
@@ -299,7 +320,10 @@ impl Session {
             log::debug!("[Session] Reading frame header");
             let (cmd, sid, data) = {
                 // 读路径只在“读取一帧”期间持有连接锁，避免阻塞并发写
-                let mut conn = self.conn_r.lock().await;
+                let mut conn_guard = self.conn_r.lock().await;
+                let conn = conn_guard
+                    .as_mut()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "session read half closed"))?;
                 conn.read_exact(&mut header_buf).await?;
                 let header = crate::proxy::session::frame::RawHeader::from_bytes(&header_buf)?;
                 log::debug!(
@@ -594,35 +618,26 @@ impl Session {
             return Ok(());
         }
 
-        // 关闭所有 Stream
+        self.close_notify.notify_waiters();
+
+        // 关闭连接 halves，触发读写循环尽快退出
         {
-            let streams = self.streams.read().await;
-            for _stream in streams.values() {
-                // 由于 Arc<Stream> 不能调用需要 &mut self 的方法
-                // 我们通过发送关闭信号来处理
-                // 这里需要重新设计关闭机制
+            let mut w = self.conn_w.lock().await;
+            if let Some(mut wh) = w.take() {
+                let _ = wh.shutdown().await;
             }
+        }
+        {
+            let mut r = self.conn_r.lock().await;
+            let _ = r.take();
+        }
+
+        // 清理 stream map，关闭下游通道
+        {
+            let mut streams = self.streams.write().await;
+            streams.clear();
         }
 
         Ok(())
-    }
-}
-
-impl Clone for Session {
-    fn clone(&self) -> Self {
-        Self {
-            conn_r: self.conn_r.clone(),
-            conn_w: self.conn_w.clone(),
-            streams: self.streams.clone(),
-            next_stream_id: AtomicU32::new(self.next_stream_id.load(Ordering::Acquire)),
-            closed: AtomicBool::new(self.closed.load(Ordering::Acquire)),
-            is_client: self.is_client,
-            peer_version: AtomicU32::new(self.peer_version.load(Ordering::Acquire)),
-            padding: self.padding.clone(),
-            pkt_counter: AtomicU32::new(self.pkt_counter.load(Ordering::Acquire)),
-            send_padding: AtomicBool::new(self.send_padding.load(Ordering::Acquire)),
-            frame_tx: self.frame_tx.clone(),
-            frame_rx: self.frame_rx.clone(),
-        }
     }
 }
