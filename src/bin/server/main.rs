@@ -11,7 +11,6 @@ use log::{debug, error, info};
 use registry::SessionRegistry;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{interval, Duration};
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Parser)]
@@ -53,11 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = SessionRegistry::new();
     let session_seq = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
-    spawn_idle_cleanup(
-        registry.clone(),
-        args.idle_session_timeout * 1000,
-        args.min_idle_session,
-    );
+    registry.spawn_idle_cleanup(args.idle_session_timeout * 1000, args.min_idle_session);
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -83,44 +78,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn spawn_idle_cleanup(registry: SessionRegistry, idle_timeout_ms: u64, min_idle: usize) {
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(30));
-        loop {
-            ticker.tick().await;
-            let snapshot = registry.snapshot().await;
-            let now_ms = now_unix_ms();
-            let mut idle: Vec<(u64, Arc<Session>)> = snapshot
-                .iter()
-                .filter_map(|(id, s)| {
-                    if s.stream_count() == 0
-                        && now_ms.saturating_sub(s.last_active_unix_ms()) > idle_timeout_ms
-                    {
-                        Some((*id, Arc::clone(s)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if idle.len() > min_idle {
-                idle.sort_by_key(|(id, _)| *id);
-                let close_count = idle.len() - min_idle;
-                for (_, s) in idle.into_iter().take(close_count) {
-                    let _ = s.close().await;
-                }
-            }
-
-            let active_streams: u32 = snapshot.iter().map(|(_, s)| s.stream_count()).sum();
-            info!(
-                "[Server] sessions={}, active_streams={}",
-                snapshot.len(),
-                active_streams
-            );
-        }
-    });
-}
-
 async fn handle_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
@@ -144,13 +101,7 @@ async fn handle_connection(
         });
     });
 
-    let on_close_registry = registry.clone();
-    let on_close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        let registry = on_close_registry.clone();
-        tokio::spawn(async move {
-            registry.remove(session_id).await;
-        });
-    });
+    let on_close = registry.make_on_close(session_id);
 
     let session = Arc::new(Session::new_server(
         Box::new(tls_stream),
@@ -162,11 +113,3 @@ async fn handle_connection(
     session.run().await?;
     Ok(())
 }
-
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
