@@ -1,4 +1,4 @@
-use super::Session;
+use super::core::Session;
 use crate::proxy::session::frame::{Frame, RawHeader, CMD_WASTE, HEADER_OVERHEAD_SIZE};
 use bytes::{BufMut, BytesMut};
 use std::io;

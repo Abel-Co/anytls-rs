@@ -1,4 +1,4 @@
-use super::Session;
+use super::core::Session;
 use crate::proxy::session::frame::{
     Frame, CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE,

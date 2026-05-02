@@ -1,9 +1,11 @@
 pub mod client;
+mod core;
+mod dispatcher;
 pub mod frame;
-pub mod session;
+mod io_loop;
 pub mod stream;
 
 pub use client::Client;
+pub use core::Session;
 pub use frame::*;
-pub use session::Session;
 pub use stream::Stream;

@@ -1,6 +1,3 @@
-mod dispatcher;
-mod io_loop;
-
 use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::frame::{Frame, CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, HEADER_OVERHEAD_SIZE};
 use crate::proxy::session::stream::Stream;
