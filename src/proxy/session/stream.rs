@@ -1,7 +1,8 @@
 use crate::proxy::session::frame::{Frame, CMD_PSH, CMD_FIN};
 use bytes::Bytes;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use std::pin::Pin;
@@ -22,7 +23,7 @@ pub struct Stream {
     read_offset: usize,
     
     // Stream 状态
-    closed: Arc<Mutex<bool>>,
+    closed: Arc<AtomicBool>,
     
     // 用于通知 Stream 关闭
     close_tx: Option<oneshot::Sender<()>>,
@@ -41,7 +42,7 @@ impl Stream {
             frame_tx,
             read_buffer: None,
             read_offset: 0,
-            closed: Arc::new(Mutex::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
             close_tx: Some(close_tx),
         }
     }
@@ -49,12 +50,12 @@ impl Stream {
   
     /// 检查是否已关闭
     pub fn is_closed(&self) -> bool {
-        *self.closed.lock().unwrap()
+        self.closed.load(Ordering::Acquire)
     }
 
     /// 标记为关闭
     fn mark_closed(&mut self) {
-        *self.closed.lock().unwrap() = true;
+        self.closed.store(true, Ordering::Release);
         if let Some(tx) = self.close_tx.take() {
             let _ = tx.send(());
         }
@@ -203,4 +204,3 @@ impl Drop for Stream {
         }
     }
 }
-
