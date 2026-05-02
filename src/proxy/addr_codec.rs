@@ -1,3 +1,5 @@
+//! RFC1928 address codec (`ATYP + ADDR + PORT`).
+
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt};
 

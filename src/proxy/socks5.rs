@@ -1,4 +1,4 @@
-use crate::proxy::socks_addr::{
+use crate::proxy::addr_codec::{
     build_socks_addr as build_socks_addr_raw, read_socks_addr_with_atyp, AddressType, SocksAddr,
 };
 use std::io;
