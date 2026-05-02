@@ -5,9 +5,12 @@ use anytls_rs::PROGRAM_VERSION_NAME;
 use clap::Parser;
 use log::{debug, error, info};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio::time::{interval, Duration};
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Parser)]
@@ -19,6 +22,12 @@ struct Args {
 
     #[arg(short = 'p', long, help = "Password")]
     password: String,
+
+    #[arg(long, default_value_t = 30, help = "Idle session timeout in seconds")]
+    idle_session_timeout: u64,
+
+    #[arg(long, default_value_t = 1, help = "Keep at least N idle sessions")]
+    min_idle_session: usize,
 }
 
 #[tokio::main]
@@ -40,14 +49,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_config = Arc::new(mkcert::generate_key_pair("localhost")?);
     let tls_acceptor = TlsAcceptor::from(tls_config);
     let padding = DefaultPaddingFactory::load();
+    let sessions: Arc<Mutex<HashMap<u64, Arc<Session>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let session_seq = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+    {
+        let sessions = Arc::clone(&sessions);
+        let idle_timeout_ms = args.idle_session_timeout * 1000;
+        let min_idle = args.min_idle_session;
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                let snapshot: Vec<(u64, Arc<Session>)> = {
+                    let map = sessions.lock().await;
+                    map.iter().map(|(k, v)| (*k, Arc::clone(v))).collect()
+                };
+                let now_ms = now_unix_ms();
+                let mut idle: Vec<(u64, Arc<Session>)> = snapshot
+                    .iter()
+                    .filter_map(|(id, s)| {
+                        if s.stream_count() == 0
+                            && now_ms.saturating_sub(s.last_active_unix_ms()) > idle_timeout_ms
+                        {
+                            Some((*id, Arc::clone(s)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if idle.len() > min_idle {
+                    idle.sort_by_key(|(id, _)| *id);
+                    let close_count = idle.len() - min_idle;
+                    for (_, s) in idle.into_iter().take(close_count) {
+                        let _ = s.close().await;
+                    }
+                }
+
+                let active_streams: u32 = snapshot.iter().map(|(_, s)| s.stream_count()).sum();
+                info!(
+                    "[Server] sessions={}, active_streams={}",
+                    snapshot.len(),
+                    active_streams
+                );
+            }
+        });
+    }
 
     loop {
         let (stream, peer) = listener.accept().await?;
         let tls_acceptor = tls_acceptor.clone();
         let padding = padding.clone();
         let expected = password_sha256;
+        let sessions = Arc::clone(&sessions);
+        let session_id = session_seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, tls_acceptor, expected, padding).await {
+            if let Err(e) = handle_connection(stream, tls_acceptor, expected, padding, sessions, session_id).await {
                 debug!("[Server] Connection {} error: {}", peer, e);
             }
         });
@@ -59,6 +116,8 @@ async fn handle_connection(
     acceptor: TlsAcceptor,
     expected_password: [u8; 32],
     padding: Arc<anytls_rs::proxy::padding::PaddingFactory>,
+    sessions: Arc<Mutex<HashMap<u64, Arc<Session>>>>,
+    session_id: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tls_stream = acceptor.accept(stream).await?;
 
@@ -83,12 +142,21 @@ async fn handle_connection(
             }
         });
     });
+    let on_close_sessions = Arc::clone(&sessions);
+    let on_close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let sessions = Arc::clone(&on_close_sessions);
+        tokio::spawn(async move {
+            sessions.lock().await.remove(&session_id);
+        });
+    });
 
     let session = Arc::new(Session::new_server(
         Box::new(tls_stream),
         Some(on_new_stream),
+        Some(on_close),
         padding,
     ));
+    sessions.lock().await.insert(session_id, Arc::clone(&session));
     session.run().await?;
     Ok(())
 }
@@ -113,6 +181,13 @@ async fn handle_stream(mut stream: Stream) -> Result<(), Box<dyn std::error::Err
     };
     tokio::join!(uplink, downlink);
     Ok(())
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 async fn read_socks_addr<S>(stream: &mut S) -> Result<String, Box<dyn std::error::Error + Send + Sync>>

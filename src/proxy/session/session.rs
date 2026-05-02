@@ -5,8 +5,9 @@ use crate::util::string_map::{StringMap, StringMapExt};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::io::{ReadHalf, WriteHalf};
 
@@ -42,6 +43,11 @@ pub struct Session {
 
     // 服务端：新流回调
     on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
+    on_close: Option<Arc<dyn Fn() + Send + Sync>>,
+
+    // 可观测状态
+    stream_count: AtomicU32,
+    last_active_unix_ms: AtomicU64,
 }
 
 impl Session {
@@ -68,6 +74,9 @@ impl Session {
             frame_rx: Mutex::new(Some(frame_rx)),
             close_notify: Notify::new(),
             on_new_stream: None,
+            on_close: None,
+            stream_count: AtomicU32::new(0),
+            last_active_unix_ms: AtomicU64::new(now_unix_ms()),
         }
     }
 
@@ -75,6 +84,7 @@ impl Session {
     pub fn new_server(
         conn: Box<dyn AsyncReadWrite>,
         on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
+        on_close: Option<Arc<dyn Fn() + Send + Sync>>,
         padding: Arc<PaddingFactory>,
     ) -> Self {
         let (conn_r, conn_w) = tokio::io::split(conn);
@@ -95,6 +105,9 @@ impl Session {
             frame_rx: Mutex::new(Some(frame_rx)),
             close_notify: Notify::new(),
             on_new_stream,
+            on_close,
+            stream_count: AtomicU32::new(0),
+            last_active_unix_ms: AtomicU64::new(now_unix_ms()),
         }
     }
 
@@ -177,6 +190,7 @@ impl Session {
         if self.is_closed() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed"));
         }
+        self.touch_activity();
 
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::AcqRel);
         
@@ -192,6 +206,7 @@ impl Session {
             let mut streams = self.streams.write().await;
             streams.insert(stream_id, data_tx);
         }
+        self.stream_count.fetch_add(1, Ordering::AcqRel);
 
         // 发送 SYN 帧
         let frame = Frame::new(CMD_SYN, stream_id);
@@ -206,7 +221,9 @@ impl Session {
         // 从 streams 中移除
         {
             let mut streams = self.streams.write().await;
-            streams.remove(&stream_id);
+            if streams.remove(&stream_id).is_some() {
+                self.stream_count.fetch_sub(1, Ordering::AcqRel);
+            }
         }
 
         // 发送 FIN 帧
@@ -218,6 +235,7 @@ impl Session {
 
     /// 写入数据帧
     pub async fn write_data_frame(&self, stream_id: u32, data: &[u8]) -> io::Result<usize> {
+        self.touch_activity();
         let frame = Frame::with_data(CMD_PSH, stream_id, Bytes::copy_from_slice(data));
         self.frame_tx
             .send(frame)
@@ -228,6 +246,7 @@ impl Session {
 
     /// 写入控制帧
     async fn write_control_frame(&self, frame: Frame) -> io::Result<usize> {
+        self.touch_activity();
         let n = frame.data.len();
         self.frame_tx
             .send(frame)
@@ -356,6 +375,7 @@ impl Session {
 
     /// 处理接收到的帧
     async fn handle_frame(&self, cmd: u8, sid: u32, data: Bytes) -> io::Result<()> {
+        self.touch_activity();
         log::debug!("[Session] Handling frame: cmd={}, sid={}, data_len={}", cmd, sid, data.len());
         
         match cmd {
@@ -405,6 +425,7 @@ impl Session {
                             let mut streams = self.streams.write().await;
                             streams.insert(sid, data_tx);
                         }
+                        self.stream_count.fetch_add(1, Ordering::AcqRel);
                         
                         // 发送 SYNACK 确认
                         let frame = Frame::new(CMD_SYNACK, sid);
@@ -449,6 +470,7 @@ impl Session {
                 let mut streams = self.streams.write().await;
                 if let Some(stream_tx) = streams.remove(&sid) {
                     drop(stream_tx);
+                    self.stream_count.fetch_sub(1, Ordering::AcqRel);
                 }
             }
            CMD_SETTINGS => {
@@ -619,6 +641,14 @@ impl Session {
         self.closed.load(Ordering::Acquire)
     }
 
+    pub fn stream_count(&self) -> u32 {
+        self.stream_count.load(Ordering::Acquire)
+    }
+
+    pub fn last_active_unix_ms(&self) -> u64 {
+        self.last_active_unix_ms.load(Ordering::Acquire)
+    }
+
     /// 关闭 Session
     pub async fn close(&self) -> io::Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
@@ -644,7 +674,23 @@ impl Session {
             let mut streams = self.streams.write().await;
             streams.clear();
         }
+        self.stream_count.store(0, Ordering::Release);
+
+        if let Some(cb) = &self.on_close {
+            cb();
+        }
 
         Ok(())
     }
+
+    fn touch_activity(&self) {
+        self.last_active_unix_ms.store(now_unix_ms(), Ordering::Release);
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
