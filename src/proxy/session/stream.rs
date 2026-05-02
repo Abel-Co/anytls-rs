@@ -1,149 +1,230 @@
-use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
+use crate::proxy::session::frame::{Frame, CMD_PSH, CMD_FIN};
+use bytes::Bytes;
 use std::io;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{mpsc, oneshot};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+/// Stream 实现 AsyncRead 和 AsyncWrite，提供读写缓冲区
 pub struct Stream {
-    id: u32,
-    pipe_reader: PipeReader,
-    pipe_writer: PipeWriter,
-    closed: Arc<tokio::sync::Mutex<bool>>,
-    reported: Arc<tokio::sync::Mutex<bool>>,
+    pub id: u32,
+    
+    // 用于从 session 读取数据
+    rx: mpsc::Receiver<Bytes>,
+    
+    // 用于向 session 写入帧
+    frame_tx: mpsc::Sender<Frame>,
+    
+    // 部分读取的缓冲区
+    read_buffer: Option<Bytes>,
+    read_offset: usize,
+    
+    // Stream 状态
+    closed: Arc<AtomicBool>,
+    
+    // 用于通知 Stream 关闭
+    close_tx: Option<oneshot::Sender<()>>,
+
+    // 异步发送状态（用于正确处理背压）
+    pending_send: Option<Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>>,
+    pending_send_len: usize,
+    pending_shutdown: Option<Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>>,
 }
 
 impl Stream {
-    pub fn new(id: u32) -> Self {
-        let (pipe_reader, pipe_writer) = pipe();
-        
+    pub fn new(
+        id: u32,
+        rx: mpsc::Receiver<Bytes>,
+        frame_tx: mpsc::Sender<Frame>,
+        close_tx: oneshot::Sender<()>,
+    ) -> Self {
         Self {
             id,
-            pipe_reader,
-            pipe_writer,
-            closed: Arc::new(tokio::sync::Mutex::new(false)),
-            reported: Arc::new(tokio::sync::Mutex::new(false)),
+            rx,
+            frame_tx,
+            read_buffer: None,
+            read_offset: 0,
+            closed: Arc::new(AtomicBool::new(false)),
+            close_tx: Some(close_tx),
+            pending_send: None,
+            pending_send_len: 0,
+            pending_shutdown: None,
         }
     }
-    
-    pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.pipe_reader.read(buf).await
-    }
-    
-    pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        // Simplified implementation
-        Ok(buf.len())
-    }
-    
-    pub async fn close(&self) -> io::Result<()> {
-        self.close_with_error(Some(io::Error::new(io::ErrorKind::BrokenPipe, "Stream closed"))).await
-    }
-    
-    pub async fn close_with_error(&self, error: Option<io::Error>) -> io::Result<()> {
-        let mut closed = self.closed.lock().await;
-        if *closed {
-            return Ok(());
-        }
-        *closed = true;
-        drop(closed);
-        
-        self.pipe_reader.close_with_error(error);
-        
-        Ok(())
-    }
-    
-    pub async fn handshake_failure(&self, _err: &str) -> io::Result<()> {
-        let mut reported = self.reported.lock().await;
-        if *reported {
-            return Ok(());
-        }
-        *reported = true;
-        drop(reported);
-        
-        // Simplified implementation
-        Ok(())
-    }
-    
-    pub async fn handshake_success(&self) -> io::Result<()> {
-        let mut reported = self.reported.lock().await;
-        if *reported {
-            return Ok(());
-        }
-        *reported = true;
-        drop(reported);
-        
-        // Simplified implementation
-        Ok(())
-    }
-    
-    pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
-        self.pipe_reader.set_read_deadline(deadline).await
-    }
-    
-    pub async fn set_write_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
-        self.pipe_writer.set_write_deadline(deadline).await
-    }
-    
-    pub async fn set_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
-        self.set_write_deadline(deadline).await?;
-        self.set_read_deadline(deadline).await
-    }
-    
-    pub fn id(&self) -> u32 {
-        self.id
-    }
-    
-    pub fn split(self) -> (Self, Self) {
-        (self.clone(), self)
-    }
-    
-    pub fn split_ref(&self) -> (Self, Self) {
-        (self.clone(), self.clone())
-    }
-}
 
-impl Clone for Stream {
-    fn clone(&self) -> Self {
-        Self {
-            id: self.id,
-            pipe_reader: PipeReader { inner: self.pipe_reader.inner.clone() },
-            pipe_writer: PipeWriter { inner: self.pipe_writer.inner.clone() },
-            closed: self.closed.clone(),
-            reported: self.reported.clone(),
+  
+    /// 检查是否已关闭
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// 标记为关闭
+    fn mark_closed(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        if let Some(tx) = self.close_tx.take() {
+            let _ = tx.send(());
         }
     }
+
+    /// 分割 Stream 为读写两部分
+    /// 使用 tokio::io::split 创建真正的读写分离
+    pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
+        tokio::io::split(self)
+    }
+
 }
 
 impl AsyncRead for Stream {
     fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        _buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        // Simplified implementation - in a real implementation, this would be more complex
-        std::task::Poll::Ready(Ok(()))
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.is_closed() {
+            log::debug!("[Stream] Stream {} is closed, returning EOF", self.id);
+            return Poll::Ready(Ok(()));
+        }
+        
+        // 首先尝试从现有缓冲区读取
+        if let Some(data) = &self.read_buffer {
+            let remaining = data.len() - self.read_offset;
+            let to_copy = remaining.min(buf.remaining());
+            
+            log::debug!("[Stream] Reading {} bytes from buffer for stream {} (remaining: {})", to_copy, self.id, remaining);
+            
+            buf.put_slice(&data[self.read_offset..self.read_offset + to_copy]);
+            
+            let new_offset = self.read_offset + to_copy;
+            if new_offset >= data.len() {
+                self.read_buffer = None;
+                self.read_offset = 0;
+            } else {
+                self.read_offset = new_offset;
+            }
+            
+            return Poll::Ready(Ok(()));
+        }
+        
+        // 尝试接收新数据
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                let data_len = data.len();
+                let to_copy = data_len.min(buf.remaining());
+                log::debug!("[Stream] Received {} bytes for stream {}, copying {}", 
+                           data_len, self.id, to_copy);
+                
+                buf.put_slice(&data[..to_copy]);
+                
+                if to_copy < data_len {
+                    self.read_buffer = Some(data);
+                    self.read_offset = to_copy;
+                    log::debug!("[Stream] Buffered {} bytes for stream {}", 
+                               data_len - to_copy, self.id);
+                }
+                
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => {
+                log::debug!("[Stream] Channel closed for stream {}, marking as closed", self.id);
+                self.mark_closed();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 impl AsyncWrite for Stream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, io::Error>> {
-        // Simplified implementation - in a real implementation, this would be more complex
-        std::task::Poll::Ready(Ok(buf.len()))
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if self.is_closed() {
+            log::debug!("[Stream] Stream {} is closed, write failed", self.id);
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream is closed",
+            )));
+        }
+
+        if self.pending_send.is_none() {
+            log::debug!("[Stream] Writing {} bytes to stream {}", buf.len(), self.id);
+            let frame = Frame::with_data(CMD_PSH, self.id, Bytes::copy_from_slice(buf));
+            let tx = self.frame_tx.clone();
+            self.pending_send = Some(Box::pin(async move { tx.send(frame).await }));
+            self.pending_send_len = buf.len();
+        }
+
+        if let Some(fut) = self.pending_send.as_mut() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    let n = self.pending_send_len;
+                    self.pending_send = None;
+                    self.pending_send_len = 0;
+                    log::debug!("[Stream] Successfully queued {} bytes for stream {}", n, self.id);
+                    Poll::Ready(Ok(n))
+                }
+                Poll::Ready(Err(_)) => {
+                    self.pending_send = None;
+                    self.pending_send_len = 0;
+                    log::debug!("[Stream] Channel closed for stream {}, write failed", self.id);
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "session is closed",
+                    )))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Pending
+        }
     }
     
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), io::Error>> {
-        std::task::Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
     
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), io::Error>> {
-        std::task::Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.is_closed() {
+            return Poll::Ready(Ok(()));
+        }
+
+        if self.pending_send.is_some() {
+            match self.as_mut().poll_write(cx, &[]) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if self.pending_shutdown.is_none() {
+            let frame = Frame::new(CMD_FIN, self.id);
+            let tx = self.frame_tx.clone();
+            self.pending_shutdown = Some(Box::pin(async move { tx.send(frame).await }));
+        }
+
+        if let Some(fut) = self.pending_shutdown.as_mut() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(_) => {
+                    self.pending_shutdown = None;
+                    self.mark_closed();
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if !self.is_closed() {
+            let frame = Frame::new(CMD_FIN, self.id);
+            let _ = self.frame_tx.try_send(frame);
+            self.mark_closed();
+        }
     }
 }

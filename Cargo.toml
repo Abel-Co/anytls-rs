@@ -9,6 +9,13 @@ repository = "https://github.com/anytls/anytls-rs"
 keywords = ["proxy", "tls", "privacy", "networking"]
 categories = ["network-programming", "command-line-utilities"]
 
+[profile.release]
+opt-level = 3          # 最高级别速度优化
+lto = "fat"            # 链接时优化，平衡性能与编译时间
+codegen-units = 1      # 最大化优化机会，提升性能
+panic = "abort"        # 移除panic展开代码，提升性能并减小体积
+strip = true           # 剥离符号信息，减小发布体积，不影响性能
+
 [[bin]]
 name = "anytls-client"
 path = "src/bin/client/main.rs"
@@ -18,28 +25,21 @@ name = "anytls-server"
 path = "src/bin/server/main.rs"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-tokio-rustls = "0.25"
-rustls = "0.22"
-rustls-pemfile = "2.0"
-rcgen = "0.13"
-x509-parser = "0.17"
+tokio = { version = "1.47", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rcgen = "0.14"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 md5 = "0.7"
 sha2 = "0.10"
 rand = "0.8"
-thiserror = "1.0"
+fastrand = "2.0"
 bytes = "1.0"
-futures = "0.3"
-async-trait = "0.1"
-url = "2.0"
-hex = "0.4"
-base64 = "0.22"
-parking_lot = "0.12"
-dashmap = "5.0"
-indexmap = "2.0"
+bincode = { version = "2.0", optional = true }
+
+[features]
+depth = ["bincode"]
+

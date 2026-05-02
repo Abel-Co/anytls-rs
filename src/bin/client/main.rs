@@ -1,14 +1,12 @@
 use anytls_rs::proxy::padding::DefaultPaddingFactory;
+use anytls_rs::proxy::client_runtime;
 use anytls_rs::proxy::session::Client;
-use anytls_rs::util::PROGRAM_VERSION_NAME;
+use anytls_rs::proxy::transport;
 use clap::Parser;
 use log::{error, info};
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsConnector;
-use rustls::ClientConfig;
-use sha2::{Digest, Sha256};
+use tokio::net::TcpListener;
+use std::time::Duration;
+use anytls_rs::PROGRAM_VERSION_NAME;
 
 #[derive(Parser)]
 #[command(name = "anytls-client")]
@@ -29,7 +27,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
     let args = Args::parse();
     
@@ -38,247 +36,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     
-    let password_sha256 = Sha256::digest(args.password.as_bytes());
+    let password_sha256 = transport::password_sha256(&args.password);
     
     info!("[Client] {}", PROGRAM_VERSION_NAME);
     info!("[Client] SOCKS5 {} => {}", args.listen, args.server);
+    info!("[Client] Session padding enabled: true");
     
     let listener = TcpListener::bind(&args.listen).await?;
     
-    let tls_config = create_tls_config(args.sni.as_deref())?;
+    let tls_config = transport::create_tls_config();
     let padding = DefaultPaddingFactory::load();
     
-    let padding_clone = padding.clone();
-    let client = Arc::new(Client::new(
-        Box::new(move || {
-            let server = args.server.clone();
-            let tls_config = tls_config.clone();
-            let password_sha256 = password_sha256.clone();
-            let padding = padding_clone.clone();
-            
-            Box::new(Box::pin(async move {
-                let stream = TcpStream::connect(&server).await?;
-                let connector = TlsConnector::from(tls_config);
-                let mut tls_stream = connector.connect("127.0.0.1".try_into().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?, stream).await?;
-                
-                // Send authentication
-                let mut auth_data = Vec::new();
-                auth_data.extend_from_slice(&password_sha256);
-                
-                let padding_factory = padding.read().await;
-                let padding_sizes = padding_factory.generate_record_payload_sizes(0);
-                let padding_len = if !padding_sizes.is_empty() {
-                    padding_sizes[0] as u16
-                } else {
-                    0
-                };
-                
-                auth_data.extend_from_slice(&padding_len.to_be_bytes());
-                if padding_len > 0 {
-                    auth_data.resize(auth_data.len() + padding_len as usize, 0);
-                }
-                
-                // Send auth data
-                tls_stream.write_all(&auth_data).await?;
-                
-                Ok(Box::new(tls_stream) as Box<dyn anytls_rs::util::r#type::AsyncReadWrite>)
-            }))
-        }),
+    // 创建客户端
+    let dial_out = transport::create_dial_out_func(
+        args.server.clone(),
+        tls_config,
+        args.sni,
+        password_sha256,
+        padding.clone(),
+    );
+    let client = Client::new(
+        dial_out,
         padding,
-        std::time::Duration::from_secs(30),
-        std::time::Duration::from_secs(30),
-        5,
-    ));
+        Duration::from_secs(30), // 空闲超时
+        1, // 最小空闲连接数
+    );
     
+    info!("[Client] Listening on {}", args.listen);
+    
+    // 监听 SOCKS5 连接
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let client = client.clone();
-        
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, client).await {
-                error!("Connection error: {}", e);
+        match listener.accept().await {
+            Ok((client_conn, addr)) => {
+                info!("[Client] New connection from {}", addr);
+                
+                // 为每个连接创建新的任务
+                let client_clone = client.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client_runtime::handle_client_connection(client_conn, client_clone).await {
+                        error!("[Client] Connection error: {}", e);
+                    }
+                });
             }
-        });
-    }
-}
-
-fn create_tls_config(_sni: Option<&str>) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
-    
-    // 使用危险的方法来禁用证书验证
-    config.dangerous().set_certificate_verifier(Arc::new(AllowAnyCertVerifier));
-    
-    Ok(Arc::new(config))
-}
-
-// 允许任何证书的验证器
-#[derive(Debug)]
-struct AllowAnyCertVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for AllowAnyCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA1,
-            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ED448,
-        ]
-    }
-}
-
-async fn handle_connection(
-    mut stream: TcpStream,
-    client: Arc<Client>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // SOCKS5 握手处理
-    let mut buffer = vec![0u8; 1024];
-    
-    // 读取客户端版本和认证方法
-    let n = stream.read(&mut buffer).await?;
-    if n < 3 {
-        return Err("Invalid SOCKS5 request".into());
-    }
-    
-    let version = buffer[0];
-    let nmethods = buffer[1] as usize;
-    
-    if version != 5 {
-        return Err("Unsupported SOCKS version".into());
-    }
-    
-    if n < 2 + nmethods {
-        return Err("Incomplete SOCKS5 request".into());
-    }
-    
-    // 检查是否支持无认证方法
-    let mut supports_no_auth = false;
-    for i in 2..2 + nmethods {
-        if buffer[i] == 0 {
-            supports_no_auth = true;
-            break;
-        }
-    }
-    
-    if !supports_no_auth {
-        return Err("No supported authentication method".into());
-    }
-    
-    // 发送认证方法选择响应
-    let response = [5, 0]; // 版本5，无认证
-    stream.write_all(&response).await?;
-    
-    // 读取连接请求
-    let n = stream.read(&mut buffer).await?;
-    if n < 10 {
-        return Err("Invalid SOCKS5 connect request".into());
-    }
-    
-    let version = buffer[0];
-    let cmd = buffer[1];
-    let _rsv = buffer[2];
-    let atyp = buffer[3];
-    
-    if version != 5 || cmd != 1 {
-        return Err("Unsupported SOCKS5 command".into());
-    }
-    
-    // 解析目标地址
-    let target_addr: String;
-    let target_port: u16;
-    
-    match atyp {
-        1 => { // IPv4
-            if n < 10 {
-                return Err("Incomplete IPv4 address".into());
+            Err(e) => {
+                error!("[Client] Accept error: {}", e);
             }
-            target_addr = format!("{}.{}.{}.{}", buffer[4], buffer[5], buffer[6], buffer[7]);
-            target_port = u16::from_be_bytes([buffer[8], buffer[9]]);
-        }
-        3 => { // 域名
-            let domain_len = buffer[4] as usize;
-            if n < 5 + domain_len + 2 {
-                return Err("Incomplete domain address".into());
-            }
-            target_addr = String::from_utf8_lossy(&buffer[5..5 + domain_len]).to_string();
-            target_port = u16::from_be_bytes([buffer[5 + domain_len], buffer[5 + domain_len + 1]]);
-        }
-        _ => return Err("Unsupported address type".into()),
-    }
-    
-    let target = format!("{}:{}", target_addr, target_port);
-    log::info!("Connecting to target: {}", target);
-    
-    // 创建到代理服务器的连接
-    let _proxy_stream = client.create_stream().await?;
-    
-    // 发送连接成功响应
-    let response = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]; // 成功响应
-    stream.write_all(&response).await?;
-    
-    // 建立到目标服务器的连接
-    let mut target_stream = match TcpStream::connect(&target).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            // 发送连接失败响应
-            let response = [5, 1, 0, 1, 0, 0, 0, 0, 0, 0]; // 连接失败
-            let _ = stream.write_all(&response).await;
-            return Err(e.into());
-        }
-    };
-    
-    // 开始数据转发
-    let (mut client_read, mut client_write) = stream.split();
-    let (mut target_read, mut target_write) = target_stream.split();
-    
-    // 双向数据转发
-    tokio::select! {
-        _ = tokio::io::copy(&mut client_read, &mut target_write) => {
-            log::debug!("Client to target stream ended");
-        }
-        _ = tokio::io::copy(&mut target_read, &mut client_write) => {
-            log::debug!("Target to client stream ended");
         }
     }
-    
-    Ok(())
 }

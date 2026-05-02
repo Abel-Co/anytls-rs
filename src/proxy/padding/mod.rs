@@ -1,7 +1,6 @@
 use crate::util::string_map::{StringMap, StringMapExt};
 use rand::Rng;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 pub const CHECK_MARK: i32 = -1;
 
@@ -18,7 +17,7 @@ static DEFAULT_PADDING_SCHEME: &str = r#"stop=8
 #[derive(Clone)]
 pub struct PaddingFactory {
     scheme: StringMap,
-    raw_scheme: Vec<u8>,
+    pub raw_scheme: bytes::Bytes,
     stop: u32,
     md5: String,
 }
@@ -35,13 +34,14 @@ impl PaddingFactory {
         if scheme.is_empty() {
             return None;
         }
-        
+
         let stop = scheme.get("stop")?.parse::<u32>().ok()?;
-        let md5 = format!("{:x}", md5::compute(raw_scheme));
-        
+        let bytes = bytes::Bytes::copy_from_slice(raw_scheme);
+        let md5 = format!("{:x}", md5::compute(&bytes));
+
         Some(Self {
             scheme,
-            raw_scheme: raw_scheme.to_vec(),
+            raw_scheme: bytes,
             stop,
             md5,
         })
@@ -80,20 +80,21 @@ impl PaddingFactory {
         &self.md5
     }
     
-    pub fn raw_scheme(&self) -> &[u8] {
-        &self.raw_scheme
-    }
-    
     pub fn stop(&self) -> u32 {
         self.stop
+    }
+    
+    /// 生成随机填充数据，使填充数据更像真实数据
+    pub fn rng_vec(&self, length: usize) -> Vec<u8> {
+        (0..length).map(|_| fastrand::u8(..)).collect()
     }
 }
 
 pub struct DefaultPaddingFactory;
 
 impl DefaultPaddingFactory {
-    pub fn load() -> Arc<RwLock<PaddingFactory>> {
-        Arc::new(RwLock::new(PaddingFactory::default()))
+    pub fn load() -> Arc<PaddingFactory> {
+        Arc::new(PaddingFactory::default())
     }
     
     pub async fn update(raw_scheme: &[u8]) -> bool {
