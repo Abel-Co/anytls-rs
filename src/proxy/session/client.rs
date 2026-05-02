@@ -29,7 +29,7 @@ pub struct Client {
     min_idle_sessions: usize,
     
     // 状态
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -46,7 +46,7 @@ impl Client {
             idle_sessions: Arc::new(Mutex::new(VecDeque::new())),
             idle_timeout,
             min_idle_sessions,
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
         };
         
         // 启动定期清理任务
@@ -270,7 +270,7 @@ impl Clone for Client {
             idle_sessions: self.idle_sessions.clone(),
             idle_timeout: self.idle_timeout,
             min_idle_sessions: self.min_idle_sessions,
-            closed: AtomicBool::new(self.closed.load(Ordering::Acquire)),
+            closed: self.closed.clone(),
         }
     }
 }

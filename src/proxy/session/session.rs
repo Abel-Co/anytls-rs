@@ -1,64 +1,45 @@
+mod dispatcher;
+mod io_loop;
+
 use crate::proxy::padding::PaddingFactory;
-use crate::proxy::session::frame::{Frame, CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_ALERT, CMD_UPDATE_PADDING_SCHEME, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_SERVER_SETTINGS, CMD_WASTE, HEADER_OVERHEAD_SIZE};
+use crate::proxy::session::frame::{Frame, CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, HEADER_OVERHEAD_SIZE};
 use crate::proxy::session::stream::Stream;
+use crate::util::r#type::AsyncReadWrite;
 use crate::util::string_map::{StringMap, StringMapExt};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::io::{ReadHalf, WriteHalf};
-
-// 使用 util 中定义的 trait
-use crate::util::r#type::AsyncReadWrite;
+use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 
 /// Session 管理多个 Stream 的连接复用
 pub struct Session {
-    conn_r: Mutex<Option<ReadHalf<Box<dyn AsyncReadWrite>>>>,
-    conn_w: Mutex<Option<WriteHalf<Box<dyn AsyncReadWrite>>>>,
-    
-    // Stream 管理
-    streams: Arc<RwLock<HashMap<u32, mpsc::Sender<Bytes>>>>,
-    next_stream_id: AtomicU32,
-    
-    // 状态管理
-    closed: AtomicBool,
-    is_client: bool,
-    
-    // 设置相关
-    peer_version: AtomicU32,
-    
-    // 填充相关
-    padding: Arc<PaddingFactory>,
-    pkt_counter: AtomicU32,
-    send_padding: AtomicBool,
-
-    // 每个 Session 单独 writer 队列
-    frame_tx: mpsc::Sender<Frame>,
-    frame_rx: Mutex<Option<mpsc::Receiver<Frame>>>,
-    close_notify: Notify,
-
-    // 服务端：新流回调
-    on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
-    on_close: Option<Arc<dyn Fn() + Send + Sync>>,
-
-    // 可观测状态
-    stream_count: AtomicU32,
-    last_active_unix_ms: AtomicU64,
+    pub(super) conn_r: Mutex<Option<ReadHalf<Box<dyn AsyncReadWrite>>>>,
+    pub(super) conn_w: Mutex<Option<WriteHalf<Box<dyn AsyncReadWrite>>>>,
+    pub(super) streams: Arc<RwLock<HashMap<u32, mpsc::Sender<Bytes>>>>,
+    pub(super) next_stream_id: AtomicU32,
+    pub(super) closed: AtomicBool,
+    pub(super) is_client: bool,
+    pub(super) peer_version: AtomicU32,
+    pub(super) padding: Arc<PaddingFactory>,
+    pub(super) pkt_counter: AtomicU32,
+    pub(super) send_padding: AtomicBool,
+    pub(super) frame_tx: mpsc::Sender<Frame>,
+    pub(super) frame_rx: Mutex<Option<mpsc::Receiver<Frame>>>,
+    pub(super) close_notify: Notify,
+    pub(super) on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
+    pub(super) on_close: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) stream_count: AtomicU32,
+    pub(super) last_active_unix_ms: AtomicU64,
 }
 
 impl Session {
-    /// 创建客户端 Session
-    pub fn new_client(
-        conn: Box<dyn AsyncReadWrite>,
-        padding: Arc<PaddingFactory>,
-    ) -> Self {
+    pub fn new_client(conn: Box<dyn AsyncReadWrite>, padding: Arc<PaddingFactory>) -> Self {
         let (conn_r, conn_w) = tokio::io::split(conn);
         let (frame_tx, frame_rx) = mpsc::channel(1024);
-        
         Self {
             conn_r: Mutex::new(Some(conn_r)),
             conn_w: Mutex::new(Some(conn_w)),
@@ -80,7 +61,6 @@ impl Session {
         }
     }
 
-    /// 创建服务端 Session
     pub fn new_server(
         conn: Box<dyn AsyncReadWrite>,
         on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
@@ -89,7 +69,6 @@ impl Session {
     ) -> Self {
         let (conn_r, conn_w) = tokio::io::split(conn);
         let (frame_tx, frame_rx) = mpsc::channel(1024);
-        
         Self {
             conn_r: Mutex::new(Some(conn_r)),
             conn_w: Mutex::new(Some(conn_w)),
@@ -111,81 +90,35 @@ impl Session {
         }
     }
 
-    /// 启动 Session
+    /// 启动 Session。采用“后台循环 + 立即返回”的模型。
     pub async fn run(self: &Arc<Self>) -> io::Result<()> {
         log::info!("[Session] Starting session (client: {})", self.is_client);
-        
         if self.is_client {
-            // 客户端发送设置
-            log::debug!("[Session] Sending client settings");
             self.send_client_settings().await?;
             log::info!("[Session] Client settings sent");
         }
 
-        // 启动每个 Session 独立 writer loop
         let mut writer_rx = self
             .frame_rx
             .lock()
             .await
             .take()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer loop already started"))?;
+
         let writer_session = Arc::clone(self);
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = writer_session.close_notify.notified() => {
-                        break;
-                    }
-                    maybe_frame = writer_rx.recv() => {
-                        match maybe_frame {
-                            Some(frame) => {
-                                if let Err(e) = writer_session.write_frame(frame).await {
-                                    log::error!("Session writer loop error: {}", e);
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
+            writer_session.run_writer_loop(&mut writer_rx).await;
         });
 
-        // 在独立异步任务中运行接收循环
-        log::debug!("[Session] Spawning receive loop task");
-        let session_clone = Arc::clone(self);
+        let recv_session = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(e) = session_clone.recv_loop().await {
+            if let Err(e) = recv_session.recv_loop().await {
                 log::error!("Session receive loop error: {}", e);
             }
         });
-
         Ok(())
     }
 
-    /// 发送客户端设置
-    async fn send_client_settings(&self) -> io::Result<()> {
-        let settings = StringMap::from([
-            ("v".to_string(), "2".to_string()),
-            ("client".to_string(), crate::PROGRAM_VERSION_NAME.to_string()),
-            ("padding-md5".to_string(), self.padding.md5().to_string()),
-        ]);
-
-        log::debug!("[Session] Client settings: {:?}", settings);
-        let frame = Frame::with_data(CMD_SETTINGS, 0, Bytes::from(settings.to_bytes()));
-        let data = frame.to_bytes();
-        // 协议要求：新会话必须“立即发送” cmdSettings。
-        // 即使开启 padding，这里也直写，避免被分包/延后。
-        let mut conn_guard = self.conn_w.lock().await;
-        let conn = conn_guard
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed"))?;
-        conn.write_all(&data).await?;
-        log::debug!("[Session] Client settings frame sent");
-        Ok(())
-    }
-
-    /// 打开新的 Stream
     pub async fn open_stream(&self) -> io::Result<Stream> {
         if self.is_closed() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed"));
@@ -193,47 +126,31 @@ impl Session {
         self.touch_activity();
 
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::AcqRel);
-        
-        // 创建数据通道
         let (data_tx, data_rx) = mpsc::channel(100);
         let (close_tx, _close_rx) = oneshot::channel();
-        
-        // 创建 Stream
         let stream = Stream::new(stream_id, data_rx, self.frame_tx.clone(), close_tx);
 
-        // 注册 Stream 到 Session
         {
             let mut streams = self.streams.write().await;
             streams.insert(stream_id, data_tx);
         }
         self.stream_count.fetch_add(1, Ordering::AcqRel);
-
-        // 发送 SYN 帧
-        let frame = Frame::new(CMD_SYN, stream_id);
-        self.write_control_frame(frame).await?;
+        self.write_control_frame(Frame::new(CMD_SYN, stream_id)).await?;
         log::debug!("[Session] SYN frame sent for stream {}", stream_id);
-
         Ok(stream)
     }
 
-    /// 关闭指定的 Stream
     pub async fn close_stream(&self, stream_id: u32) -> io::Result<()> {
-        // 从 streams 中移除
         {
             let mut streams = self.streams.write().await;
             if streams.remove(&stream_id).is_some() {
                 self.stream_count.fetch_sub(1, Ordering::AcqRel);
             }
         }
-
-        // 发送 FIN 帧
-        let frame = Frame::new(CMD_FIN, stream_id);
-        self.write_control_frame(frame).await?;
-
+        self.write_control_frame(Frame::new(CMD_FIN, stream_id)).await?;
         Ok(())
     }
 
-    /// 写入数据帧
     pub async fn write_data_frame(&self, stream_id: u32, data: &[u8]) -> io::Result<usize> {
         self.touch_activity();
         let frame = Frame::with_data(CMD_PSH, stream_id, Bytes::copy_from_slice(data));
@@ -244,8 +161,7 @@ impl Session {
         Ok(data.len() + HEADER_OVERHEAD_SIZE)
     }
 
-    /// 写入控制帧
-    async fn write_control_frame(&self, frame: Frame) -> io::Result<usize> {
+    pub(super) async fn write_control_frame(&self, frame: Frame) -> io::Result<usize> {
         self.touch_activity();
         let n = frame.data.len();
         self.frame_tx
@@ -255,388 +171,22 @@ impl Session {
         Ok(n + HEADER_OVERHEAD_SIZE)
     }
 
-    /// 写入帧
-    async fn write_frame(&self, frame: Frame) -> io::Result<usize> {
-        let data = frame.to_bytes().to_vec();
-        log::debug!("[Session] Writing frame: {:?}, bytes: {:?}", frame, &data);
-        self.write_conn(&data).await
-    }
-
-    /// 写入连接
-    async fn write_conn(&self, data: &[u8]) -> io::Result<usize> {
+    async fn send_client_settings(&self) -> io::Result<()> {
+        let settings = StringMap::from([
+            ("v".to_string(), "2".to_string()),
+            ("client".to_string(), crate::PROGRAM_VERSION_NAME.to_string()),
+            ("padding-md5".to_string(), self.padding.md5().to_string()),
+        ]);
+        let frame = Frame::with_data(CMD_SETTINGS, 0, Bytes::from(settings.to_bytes()));
+        let data = frame.to_bytes();
         let mut conn_guard = self.conn_w.lock().await;
         let conn = conn_guard
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed"))?;
-        
-        log::debug!("[Session] Writing {} bytes to connection", data.len());
-
-        // 处理填充
-        if self.send_padding.load(Ordering::Acquire) {
-            log::debug!("[Session] Writing with padding");
-            self.write_with_padding(conn, data).await
-        } else {
-            log::debug!("[Session] Writing without padding");
-            conn.write_all(data).await?;
-            Ok(data.len())
-        }
-    }
-
-    /// 带填充的写入
-    async fn write_with_padding<W>(&self, conn: &mut W, data: &[u8]) -> io::Result<usize>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let pkt = self.pkt_counter.fetch_add(1, Ordering::AcqRel);
-        if pkt >= self.padding.stop() {
-            self.send_padding.store(false, Ordering::Release);
-            conn.write_all(data).await?;
-            return Ok(data.len());
-        }
-
-        // 兼容优先：业务帧必须保持完整，不对 AnyTLS 帧做字节级切分。
-        // 先直发业务帧，再根据策略追加 CMD_WASTE 填充帧。
-        conn.write_all(data).await?;
-
-        // 按策略逐段“消费”本次业务数据，剩余部分用 CMD_WASTE 补齐。
-        // 注意：这里不会切分业务帧，只做额外填充帧，优先保证协议互通。
-        let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
-        let mut payload_remaining = data.len();
-        for size in pkt_sizes {
-            if size == crate::proxy::padding::CHECK_MARK {
-                // c: 若业务数据已耗尽，则本次 Write 提前结束
-                if payload_remaining == 0 {
-                    break;
-                }
-                continue;
-            }
-
-            let target_payload = size as usize;
-            let consumed = payload_remaining.min(target_payload);
-            payload_remaining -= consumed;
-
-            // 该段目标比业务消耗更多时，用 WASTE 补齐差值
-            if target_payload > consumed + HEADER_OVERHEAD_SIZE {
-                let waste_payload_len = target_payload - consumed - HEADER_OVERHEAD_SIZE;
-                let mut waste = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + waste_payload_len);
-                waste.put_u8(CMD_WASTE);
-                waste.put_u32(0);
-                waste.put_u16(waste_payload_len as u16);
-                waste.extend_from_slice(&self.padding.rng_vec(waste_payload_len));
-                conn.write_all(&waste).await?;
-            }
-        }
-
-        Ok(data.len())
-    }
-
-    /// 接收循环
-    async fn recv_loop(&self) -> io::Result<()> {
-        let mut header_buf = [0u8; HEADER_OVERHEAD_SIZE];
-
-        loop {
-            if self.is_closed() {
-                log::debug!("[Session] Session closed, exiting receive loop");
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed"));
-            }
-
-            // 读取头部
-            log::debug!("[Session] Reading frame header");
-            let (cmd, sid, data) = {
-                // 读路径只在“读取一帧”期间持有连接锁，避免阻塞并发写
-                let mut conn_guard = self.conn_r.lock().await;
-                let conn = conn_guard
-                    .as_mut()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "session read half closed"))?;
-                conn.read_exact(&mut header_buf).await?;
-                let header = crate::proxy::session::frame::RawHeader::from_bytes(&header_buf)?;
-                log::debug!(
-                    "[Session] Received frame header: cmd={}, sid={}, length={}",
-                    header.cmd,
-                    header.sid,
-                    header.length
-                );
-
-                let mut data = BytesMut::with_capacity(header.length as usize);
-                if header.length > 0 {
-                    data.resize(header.length as usize, 0);
-                    conn.read_exact(&mut data).await?;
-                    log::debug!("[Session] Read {} bytes of frame data", data.len());
-                }
-
-                (header.cmd, header.sid, data.freeze())
-            };
-
-            // 处理帧
-            log::debug!("[Session] Processing frame: cmd={}, sid={}", cmd, sid);
-            self.handle_frame(cmd, sid, data).await?;
-        }
-    }
-
-    /// 处理接收到的帧
-    async fn handle_frame(&self, cmd: u8, sid: u32, data: Bytes) -> io::Result<()> {
-        self.touch_activity();
-        log::debug!("[Session] Handling frame: cmd={}, sid={}, data_len={}", cmd, sid, data.len());
-        
-        match cmd {
-            CMD_WASTE => {
-                // 填充数据 - 完全忽略
-                // 这是填充包，不需要任何处理
-                log::debug!("[Session] Received WASTE frame for stream {}", sid);
-            }
-            CMD_PSH => {
-                // 数据推送 - 将数据发送到对应的 Stream
-                log::debug!("[Session] Processing PSH frame for stream {}", sid);
-                if !data.is_empty() {
-                    let data_len = data.len();
-                    let streams = self.streams.read().await;
-                    if let Some(stream_tx) = streams.get(&sid) {
-                        if let Err(_) = stream_tx.try_send(data) {
-                            log::warn!("[Session] Failed to send data to stream {}: channel full", sid);
-                        } else {
-                            log::debug!("[Session] Successfully sent {} bytes to stream {}", data_len, sid);
-                        }
-                    } else {
-                        log::warn!("[Session] Received data for unknown stream: {}", sid);
-                    }
-                } else {
-                    log::debug!("[Session] Received empty PSH frame for stream {}", sid);
-                }
-            }
-            CMD_SYN => {
-                // 流打开请求
-                if !self.is_client {
-                    // 服务端处理新的 Stream 请求
-                    if self.streams.read().await.contains_key(&sid) {
-                        // Stream 已存在，发送错误响应
-                        let error_msg = format!("Stream {} already exists", sid);
-                        let frame = Frame::with_data(CMD_SYNACK, sid, Bytes::from(error_msg));
-                        if let Err(e) = self.write_control_frame(frame).await {
-                            log::error!("Failed to send SYNACK error for stream {}: {}", sid, e);
-                        }
-                    } else {
-                        // 创建新的 Stream
-                        let (data_tx, data_rx) = mpsc::channel(100);
-                        let (close_tx, _close_rx) = oneshot::channel();
-                        let stream = Stream::new(sid, data_rx, self.frame_tx.clone(), close_tx);
-                        
-                        // 注册 Stream 到 Session
-                        {
-                            let mut streams = self.streams.write().await;
-                            streams.insert(sid, data_tx);
-                        }
-                        self.stream_count.fetch_add(1, Ordering::AcqRel);
-                        
-                        // 发送 SYNACK 确认
-                        let frame = Frame::new(CMD_SYNACK, sid);
-                        if let Err(e) = self.write_control_frame(frame).await {
-                            log::error!("Failed to send SYNACK for stream {}: {}", sid, e);
-                            // 如果发送失败，移除刚创建的 Stream
-                            let mut streams = self.streams.write().await;
-                            streams.remove(&sid);
-                        } else {
-                            log::info!("Stream {} opened successfully", sid);
-                            if let Some(cb) = &self.on_new_stream {
-                                cb(stream);
-                            }
-                        }
-                    }
-                } else {
-                    // 客户端不应该收到 SYN，记录警告
-                    log::warn!("Client received unexpected SYN for stream: {}", sid);
-                }
-            }
-            CMD_SYNACK => {
-                // 流打开确认
-                if self.is_client {
-                    if let Some(_stream_tx) = self.streams.read().await.get(&sid) {
-                        if !data.is_empty() {
-                            // 包含错误信息
-                            let error_msg = String::from_utf8_lossy(&data);
-                            log::error!("Stream {} open failed: {}", sid, error_msg);
-                        } else {
-                            // 成功打开
-                            log::info!("Stream {} opened successfully", sid);
-                        }
-                    } else {
-                        log::warn!("Received SYNACK for unknown stream: {}", sid);
-                    }
-                } else {
-                    // 服务端不应该收到 SYNACK，记录警告
-                    log::warn!("Server received unexpected SYNACK for stream: {}", sid);
-                }
-            }
-            CMD_FIN => {
-                let mut streams = self.streams.write().await;
-                if let Some(stream_tx) = streams.remove(&sid) {
-                    drop(stream_tx);
-                    self.stream_count.fetch_sub(1, Ordering::AcqRel);
-                }
-            }
-           CMD_SETTINGS => {
-                // 客户端设置
-                if !self.is_client && !data.is_empty() {
-                    self.handle_client_settings(data).await?;
-                } else if self.is_client {
-                    log::warn!("Client received unexpected SETTINGS");
-                }
-            }
-            CMD_ALERT => {
-                // 警告消息
-                if !data.is_empty() {
-                    let alert_msg = String::from_utf8_lossy(&data);
-                    if self.is_client {
-                        log::error!("Alert from server: {}", alert_msg);
-                    } else {
-                        log::error!("Alert from client: {}", alert_msg);
-                    }
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("Alert received: {}", alert_msg)));
-                } else {
-                    log::warn!("Received empty alert");
-                }
-            }
-            CMD_UPDATE_PADDING_SCHEME => {
-                // 更新填充方案
-                if self.is_client && !data.is_empty() {
-                    self.handle_update_padding_scheme(data).await?;
-                } else if !self.is_client {
-                    log::warn!("Server received unexpected UPDATE_PADDING_SCHEME");
-                }
-            }
-            CMD_HEART_REQUEST => {
-                // 心跳请求 - 立即回复
-                let frame = Frame::new(CMD_HEART_RESPONSE, sid);
-                if let Err(e) = self.write_control_frame(frame).await {
-                    log::error!("Failed to send heartbeat response: {}", e);
-                } else {
-                    log::debug!("Sent heartbeat response for stream: {}", sid);
-                }
-            }
-            CMD_HEART_RESPONSE => {
-                // 心跳响应 - 记录接收
-                log::debug!("Received heartbeat response for stream: {}", sid);
-            }
-            CMD_SERVER_SETTINGS => {
-                // 服务端设置
-                if self.is_client && !data.is_empty() {
-                    log::debug!("[Session] Received server settings, processing...");
-                    self.handle_server_settings(data).await?;
-                    log::debug!("[Session] Server settings processed, ready for streams");
-                } else if !self.is_client {
-                    log::warn!("[Session] Server received unexpected SERVER_SETTINGS");
-                }
-            }
-            _ => {
-                // 未知命令
-                log::warn!("Unknown command received: {} for stream: {}", cmd, sid);
-                // 对于未知命令，我们选择忽略而不是返回错误
-                // 这样可以保持协议的向前兼容性
-            }
-        }
-
+        conn.write_all(&data).await?;
         Ok(())
     }
 
-    /// 处理客户端设置
-    async fn handle_client_settings(&self, data: Bytes) -> io::Result<()> {
-        log::debug!("[Session] handle_client_settings: received {} bytes of settings data: {:?}", data.len(), &data);
-
-        let settings = StringMap::from_bytes(&data);
-        log::debug!("[Session] handle_client_settings: parsed settings: {:?}", settings);
-
-        // 检查填充方案
-        if let Some(padding_md5) = settings.get("padding-md5") {
-            log::debug!("[Session] handle_client_settings: padding MD5 - received: {}, current: {}", padding_md5, self.padding.md5());
-
-            if padding_md5 != self.padding.md5() {
-                let raw_scheme = self.padding.raw_scheme.clone();
-                log::debug!("[Session] handle_client_settings: sending padding scheme update ({} bytes)", raw_scheme.len());
-
-                let frame = Frame::with_data(CMD_UPDATE_PADDING_SCHEME, 0, Bytes::from(raw_scheme));
-                self.write_control_frame(frame).await?;
-                log::debug!("[Session] handle_client_settings: padding scheme update frame sent");
-            } else {
-                log::debug!("[Session] handle_client_settings: padding schemes match, no update needed");
-            }
-        } else {
-            log::debug!("[Session] handle_client_settings: no padding-md5 found in settings");
-        }
-
-        // 检查客户端版本
-        if let Some(version) = settings.get("v") {
-            if let Ok(v) = version.parse::<u32>() {
-                let old_version = self.peer_version.load(Ordering::Acquire);
-                self.peer_version.store(v, Ordering::Release);
-                log::debug!("[Session] handle_client_settings: version updated from {} to {}", old_version, v);
-
-                if v >= 2 {
-                    // 发送服务端设置
-                    let server_settings = StringMap::from([("v".to_string(), "2".to_string())]);
-                    log::debug!("[Session] handle_client_settings: sending server settings: {:?}", server_settings);
-
-                    let frame = Frame::with_data(CMD_SERVER_SETTINGS, 0, Bytes::from(server_settings.to_bytes()));
-                    self.write_control_frame(frame).await?;
-                    log::debug!("[Session] handle_client_settings: server settings frame sent");
-                } else {
-                    log::debug!("[Session] handle_client_settings: version {} < 2, not sending server settings", v);
-                }
-            } else {
-                log::warn!("[Session] handle_client_settings: failed to parse version: '{}'", version);
-            }
-        } else {
-            log::debug!("[Session] handle_client_settings: no version found in settings");
-        }
-
-        log::debug!("[Session] handle_client_settings: processing completed successfully");
-        Ok(())
-    }
-
-    /// 处理服务端设置
-    async fn handle_server_settings(&self, data: Bytes) -> io::Result<()> {
-        let settings = StringMap::from_bytes(&data);
-        if let Some(version) = settings.get("v") {
-            if let Ok(v) = version.parse::<u32>() {
-                self.peer_version.store(v, Ordering::Release);
-            }
-        }
-        Ok(())
-    }
-
-    /// 处理填充方案更新
-    async fn handle_update_padding_scheme(&self, data: Bytes) -> io::Result<()> {
-        // 尝试创建新的填充方案
-        if let Some(new_padding) = crate::proxy::padding::PaddingFactory::new(&data) {
-            // 验证填充方案的 MD5
-            let new_md5 = new_padding.md5();
-            let current_md5 = self.padding.md5();
-            
-            if new_md5 != current_md5 {
-                log::info!("Updating padding scheme from {} to {}", current_md5, new_md5);
-                
-                // 这里应该更新全局填充方案
-                // 由于当前架构限制，我们只能记录日志
-                // 在实际应用中，可能需要通过回调或事件通知机制来更新全局填充方案
-                log::info!("New padding scheme MD5: {}", new_md5);
-                
-                // 发送确认（可选）
-                let ack_data = format!("Padding scheme updated to: {}", new_md5);
-                let frame = Frame::with_data(CMD_UPDATE_PADDING_SCHEME, 0, Bytes::from(ack_data));
-                if let Err(e) = self.write_control_frame(frame).await {
-                    log::error!("Failed to send padding scheme update ack: {}", e);
-                }
-            } else {
-                log::debug!("Received same padding scheme, no update needed");
-            }
-        } else {
-            log::error!("Invalid padding scheme data received");
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid padding scheme"));
-        }
-        
-        Ok(())
-    }
-
-
-    /// 检查是否已关闭
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
@@ -649,15 +199,12 @@ impl Session {
         self.last_active_unix_ms.load(Ordering::Acquire)
     }
 
-    /// 关闭 Session
     pub async fn close(&self) -> io::Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-
         self.close_notify.notify_waiters();
 
-        // 关闭连接 halves，触发读写循环尽快退出
         {
             let mut w = self.conn_w.lock().await;
             if let Some(mut wh) = w.take() {
@@ -668,22 +215,18 @@ impl Session {
             let mut r = self.conn_r.lock().await;
             let _ = r.take();
         }
-
-        // 清理 stream map，关闭下游通道
         {
             let mut streams = self.streams.write().await;
             streams.clear();
         }
         self.stream_count.store(0, Ordering::Release);
-
         if let Some(cb) = &self.on_close {
             cb();
         }
-
         Ok(())
     }
 
-    fn touch_activity(&self) {
+    pub(super) fn touch_activity(&self) {
         self.last_active_unix_ms.store(now_unix_ms(), Ordering::Release);
     }
 }
