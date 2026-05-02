@@ -1,9 +1,10 @@
 use anytls_rs::proxy::padding::{DefaultPaddingFactory, PaddingFactory};
 use anytls_rs::proxy::session::Client;
+use anytls_rs::proxy::socks5;
 use clap::Parser;
 use log::{error, info};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use bytes::{BufMut, BytesMut};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
@@ -11,7 +12,6 @@ use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use anytls_rs::PROGRAM_VERSION_NAME;
-use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Parser)]
 #[command(name = "anytls-client")]
@@ -92,91 +92,10 @@ async fn handle_client_connection(
     mut client_conn: TcpStream,
     client: Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    log::debug!("[Client] Starting SOCKS5 handshake");
-    
-    // 读取 SOCKS5 握手
-    let mut buffer = [0u8; 1024];
-    let n = client_conn.read(&mut buffer).await?;
-    log::debug!("[Client] Received {} bytes for SOCKS5 handshake: {:?}", n, &buffer[..n]);
-    
-    if n < 3 {
-        return Err("Invalid SOCKS5 handshake".into());
-    }
-    
-    // 检查版本
-    if buffer[0] != 0x05 {
-        return Err("Unsupported SOCKS version".into());
-    }
-    
-    // 检查认证方法数量
-    let nmethods = buffer[1] as usize;
-    log::debug!("[Client] Number of authentication methods: {}", nmethods);
-    if n < 2 + nmethods {
-        return Err("Invalid SOCKS5 handshake".into());
-    }
-    
-    // 检查是否有无认证方法
-    let mut has_no_auth = false;
-    for i in 2..2 + nmethods {
-        if buffer[i] == 0x00 {
-            has_no_auth = true;
-            break;
-        }
-    }
-    
-    if !has_no_auth {
-        return Err("No acceptable authentication method".into());
-    }
-    
-    log::debug!("[Client] Authentication method accepted (no auth)");
-    
-    // 发送认证响应
-    client_conn.write_all(&[0x05, 0x00]).await?;
-    log::debug!("[Client] Sent authentication response");
-    
-    // 读取连接请求
-    let n = client_conn.read(&mut buffer).await?;
-    log::debug!("[Client] Received {} bytes for connection request: {:?}", n, &buffer[..n]);
-    if n < 10 {
-        return Err("Invalid SOCKS5 request".into());
-    }
-    
-    // 检查版本和命令
-    if buffer[0] != 0x05 || buffer[1] != 0x01 {
-        return Err("Unsupported SOCKS5 command".into());
-    }
-    
-    // 解析目标地址
-    let addr_type = buffer[3];
-    log::debug!("[Client] Address type: {}", addr_type);
-    let target_addr: String;
-    let port: u16;
-    
-    (target_addr, port) = match addr_type {
-        0x01 => { // IPv4
-            if n < 10 {
-                return Err("Invalid IPv4 address".into());
-            }
-            let addr = format!("{}.{}.{}.{}", buffer[4], buffer[5], buffer[6], buffer[7]);
-            let port = u16::from_be_bytes([buffer[8], buffer[9]]);
-            (addr, port)
-        }
-        0x03 => { // 域名
-            let domain_len = buffer[4] as usize;
-            log::debug!("[Client] Domain length: {}", domain_len);
-            if n < 7 + domain_len {
-                return Err("Invalid domain name".into());
-            }
-            let addr = String::from_utf8_lossy(&buffer[5..5 + domain_len]).to_string();
-            let port = u16::from_be_bytes([buffer[5 + domain_len], buffer[6 + domain_len]]);
-            (addr, port)
-        }
-        _ => {
-            return Err("Unsupported address type".into());
-        }
-    };
-    
-    info!("[Client] Connecting to {}:{}", target_addr, port);
+    socks5::accept_no_auth(&mut client_conn).await?;
+    let req = socks5::read_connect_request(&mut client_conn).await?;
+
+    info!("[Client] Connecting to {}:{}", req.host, req.port);
     
     // 创建 AnyTLS 流
     log::debug!("[Client] Creating AnyTLS stream");
@@ -185,19 +104,17 @@ async fn handle_client_connection(
 
     // 按协议要求，Stream 建立后首先发送目标地址（SocksAddr）
     // 服务端收到后才会发起真实出站连接。
-    let target_socks_addr = build_socks_addr(addr_type, &target_addr, port)?;
+    let target_socks_addr = socks5::build_socks_addr(&req)?;
     anytls_stream.write_all(&target_socks_addr).await?;
     anytls_stream.flush().await?;
     log::debug!(
         "[Client] Sent SocksAddr to server: {}:{} ({} bytes)",
-        target_addr,
-        port,
+        req.host,
+        req.port,
         target_socks_addr.len()
     );
     
-    // 发送连接成功响应
-    let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-    client_conn.write_all(&response).await?;
+    socks5::write_success_reply(&mut client_conn).await?;
     log::debug!("[Client] Sent SOCKS5 connection success response");
     
     // 使用真正的并行数据转发
@@ -235,45 +152,6 @@ async fn handle_client_connection(
     }
 
     Ok(())
-}
-
-fn build_socks_addr(addr_type: u8, target_addr: &str, port: u16) -> Result<Vec<u8>, std::io::Error> {
-    let mut out = Vec::with_capacity(32);
-    match addr_type {
-        0x01 => {
-            out.push(0x01);
-            let ip: Ipv4Addr = target_addr.parse().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IPv4 address: {e}"))
-            })?;
-            out.extend_from_slice(&ip.octets());
-        }
-        0x03 => {
-            out.push(0x03);
-            if target_addr.len() > u8::MAX as usize {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "domain is too long for SOCKS5",
-                ));
-            }
-            out.push(target_addr.len() as u8);
-            out.extend_from_slice(target_addr.as_bytes());
-        }
-        0x04 => {
-            out.push(0x04);
-            let ip: Ipv6Addr = target_addr.parse().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IPv6 address: {e}"))
-            })?;
-            out.extend_from_slice(&ip.octets());
-        }
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "unsupported address type",
-            ));
-        }
-    }
-    out.extend_from_slice(&port.to_be_bytes());
-    Ok(out)
 }
 
 fn create_dial_out_func(
