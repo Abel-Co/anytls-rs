@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 pub type StringMap = HashMap<String, String>;
 
-#[allow(unused)]
+#[cfg(feature = "depth")]
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
 pub trait StringMapExt {
