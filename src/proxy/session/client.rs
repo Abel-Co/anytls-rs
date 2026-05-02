@@ -8,6 +8,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
+struct IdleEntry {
+    session: Arc<Session>,
+    idle_since_ms: u64,
+}
+
 /// 客户端连接管理器，实现连接复用
 pub struct Client {
     // 连接函数
@@ -17,7 +22,7 @@ pub struct Client {
     padding: Arc<PaddingFactory>,
     
     // 空闲 Session 管理
-    idle_sessions: Arc<Mutex<VecDeque<Arc<Session>>>>,
+    idle_sessions: Arc<Mutex<VecDeque<IdleEntry>>>,
     
     // 配置
     idle_timeout: Duration,
@@ -78,12 +83,30 @@ impl Client {
 
     /// 获取空闲的 Session
     async fn get_idle_session(&self) -> Option<Arc<Session>> {
-        let mut idle_sessions = self.idle_sessions.lock().await;
-        
-        // 直接返回第一个可用的 Session
-        // 注意：这里没有过期检查，因为 VecDeque 设计更简单
-        // 如果需要过期检查，可以考虑在 Session 内部添加时间戳
-        idle_sessions.pop_back()
+        let mut to_close = Vec::new();
+        let mut selected = None;
+        {
+            let mut idle_sessions = self.idle_sessions.lock().await;
+            let now = now_unix_ms();
+            let timeout_ms = self.idle_timeout.as_millis() as u64;
+
+            while let Some(entry) = idle_sessions.pop_back() {
+                if entry.session.is_closed() {
+                    continue;
+                }
+                if timeout_ms > 0 && now.saturating_sub(entry.idle_since_ms) > timeout_ms {
+                    to_close.push(entry.session);
+                    continue;
+                }
+                selected = Some(entry.session);
+                break;
+            }
+        }
+
+        for session in to_close {
+            let _ = session.close().await;
+        }
+        selected
     }
 
     /// 创建新的 Session
@@ -110,7 +133,10 @@ impl Client {
         }
 
         let mut idle_sessions = self.idle_sessions.lock().await;
-        idle_sessions.push_back(session);
+        idle_sessions.push_back(IdleEntry {
+            session,
+            idle_since_ms: now_unix_ms(),
+        });
         
         // 保持最小空闲 Session 数量
         if idle_sessions.len() > self.min_idle_sessions * 2 {
@@ -174,16 +200,42 @@ impl Client {
 
     /// 清理空闲的 Session
     pub async fn cleanup_idle_sessions(&self) {
-        let mut idle_sessions = self.idle_sessions.lock().await;
-        
-        // 保持最小空闲 Session 数量
-        if idle_sessions.len() > self.min_idle_sessions {
-            let excess = idle_sessions.len() - self.min_idle_sessions;
-            for _ in 0..excess {
-                if let Some(session) = idle_sessions.pop_front() {
-                    session.close().await.ok();
+        let mut to_close = Vec::new();
+        {
+            let mut idle_sessions = self.idle_sessions.lock().await;
+            let now = now_unix_ms();
+            let timeout_ms = self.idle_timeout.as_millis() as u64;
+            let keep_min = self.min_idle_sessions;
+
+            // 仅在超过 min_idle 时，清理超时/已关闭项
+            let mut kept = 0usize;
+            let mut rebuilt = VecDeque::with_capacity(idle_sessions.len());
+            while let Some(entry) = idle_sessions.pop_front() {
+                if entry.session.is_closed() {
+                    continue;
+                }
+                let expired = timeout_ms > 0 && now.saturating_sub(entry.idle_since_ms) > timeout_ms;
+                if expired && kept >= keep_min {
+                    to_close.push(entry.session);
+                    continue;
+                }
+                kept += 1;
+                rebuilt.push_back(entry);
+            }
+            *idle_sessions = rebuilt;
+
+            if idle_sessions.len() > keep_min {
+                let excess = idle_sessions.len() - keep_min;
+                for _ in 0..excess {
+                    if let Some(entry) = idle_sessions.pop_front() {
+                        to_close.push(entry.session);
+                    }
                 }
             }
+        }
+
+        for session in to_close {
+            let _ = session.close().await;
         }
     }
 
@@ -195,12 +247,19 @@ impl Client {
 
         // 清空空闲 Session
         let mut idle_sessions = self.idle_sessions.lock().await;
-        for session in idle_sessions.drain(..) {
-            session.close().await.ok();
+        for entry in idle_sessions.drain(..) {
+            entry.session.close().await.ok();
         }
 
         Ok(())
     }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Clone for Client {
