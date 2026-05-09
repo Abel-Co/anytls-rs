@@ -1,5 +1,5 @@
-use anytls_rs::proxy::session::Stream;
 use anytls_rs::proxy::addr_codec::read_socks_addr;
+use anytls_rs::proxy::session::Stream;
 use tokio::net::TcpStream;
 
 pub async fn handle_stream(mut stream: Stream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

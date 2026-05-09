@@ -17,17 +17,17 @@ struct IdleEntry {
 pub struct Client {
     // 连接函数
     dial_out: DialOutFunc,
-    
+
     // 填充工厂
     padding: Arc<PaddingFactory>,
-    
+
     // 空闲 Session 管理
     idle_sessions: Arc<Mutex<VecDeque<IdleEntry>>>,
-    
+
     // 配置
     idle_timeout: Duration,
     min_idle_sessions: usize,
-    
+
     // 状态
     closed: Arc<AtomicBool>,
 }
@@ -48,10 +48,10 @@ impl Client {
             min_idle_sessions,
             closed: Arc::new(AtomicBool::new(false)),
         };
-        
+
         // 启动定期清理任务
         client.start_cleanup_task();
-        
+
         client
     }
 
@@ -113,12 +113,9 @@ impl Client {
     async fn create_session(&self) -> io::Result<Arc<Session>> {
         // 建立连接
         let conn = (self.dial_out)().await?;
-        
+
         // 创建 Session
-        let session = Arc::new(Session::new_client(
-            conn,
-            self.padding.clone(),
-        ));
+        let session = Arc::new(Session::new_client(conn, self.padding.clone()));
 
         // 启动 Session（同步等待 run 完成，run 内部会自行启动接收循环）
         session.run().await?;
@@ -137,31 +134,29 @@ impl Client {
             session,
             idle_since_ms: now_unix_ms(),
         });
-        
+
         // 保持最小空闲 Session 数量
         if idle_sessions.len() > self.min_idle_sessions * 2 {
             idle_sessions.truncate(self.min_idle_sessions);
         }
-        
+
         log::debug!("Session returned to idle pool");
     }
-
-
 
     /// 启动定期清理任务
     fn start_cleanup_task(&self) {
         let client = self.clone();
         let cleanup_interval = Duration::from_secs(30); // 每30秒清理一次
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(cleanup_interval);
             loop {
                 interval.tick().await;
-                
+
                 if client.closed.load(Ordering::Acquire) {
                     break;
                 }
-                
+
                 client.ensure_min_idle_sessions().await;
                 client.cleanup_idle_sessions().await;
                 log::debug!("Performed idle session cleanup");

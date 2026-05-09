@@ -46,13 +46,13 @@ impl PaddingFactory {
             md5,
         })
     }
-    
+
     pub fn generate_record_payload_sizes(&self, pkt: u32) -> Vec<i32> {
         let mut pkt_sizes = Vec::new();
-        
+
         if let Some(s) = self.scheme.get(&pkt.to_string()) {
             let s_ranges: Vec<&str> = s.split(',').collect();
-            
+
             for s_range in s_ranges {
                 if s_range == "c" {
                     pkt_sizes.push(CHECK_MARK);
@@ -72,18 +72,18 @@ impl PaddingFactory {
                 }
             }
         }
-        
+
         pkt_sizes
     }
-    
+
     pub fn md5(&self) -> &str {
         &self.md5
     }
-    
+
     pub fn stop(&self) -> u32 {
         self.stop
     }
-    
+
     /// 生成随机填充数据，使填充数据更像真实数据
     pub fn rng_vec(&self, length: usize) -> Vec<u8> {
         (0..length).map(|_| fastrand::u8(..)).collect()
@@ -96,7 +96,7 @@ impl DefaultPaddingFactory {
     pub fn load() -> Arc<PaddingFactory> {
         Arc::new(PaddingFactory::default())
     }
-    
+
     pub async fn update(raw_scheme: &[u8]) -> bool {
         if let Some(_factory) = PaddingFactory::new(raw_scheme) {
             // In a real implementation, this would update a global instance

@@ -2,16 +2,13 @@ use super::core::Session;
 use crate::proxy::session::frame::{Frame, RawHeader, CMD_WASTE, HEADER_OVERHEAD_SIZE};
 use bytes::{BufMut, BytesMut};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 impl Session {
-    pub(super) async fn run_writer_loop(
-        self: Arc<Self>,
-        writer_rx: &mut mpsc::Receiver<Frame>,
-    ) {
+    pub(super) async fn run_writer_loop(self: Arc<Self>, writer_rx: &mut mpsc::Receiver<Frame>) {
         loop {
             tokio::select! {
                 _ = self.close_notify.notified() => break,
@@ -36,9 +33,9 @@ impl Session {
 
     async fn write_conn(&self, data: &[u8]) -> io::Result<usize> {
         let mut conn_guard = self.conn_w.lock().await;
-        let conn = conn_guard
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed"))?;
+        let conn = conn_guard.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed")
+        })?;
 
         if self.send_padding.load(Ordering::Acquire) {
             self.write_with_padding(conn, data).await
@@ -94,9 +91,9 @@ impl Session {
 
             let (cmd, sid, data) = {
                 let mut conn_guard = self.conn_r.lock().await;
-                let conn = conn_guard
-                    .as_mut()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "session read half closed"))?;
+                let conn = conn_guard.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "session read half closed")
+                })?;
                 conn.read_exact(&mut header_buf).await?;
                 let header = RawHeader::from_bytes(&header_buf)?;
                 let mut data = BytesMut::with_capacity(header.length as usize);
