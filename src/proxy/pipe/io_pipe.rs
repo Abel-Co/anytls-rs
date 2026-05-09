@@ -66,7 +66,7 @@ impl PipeWriter {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Pipe closed"));
         }
 
-        if let Err(_) = inner.data_channel.send(buf.to_vec()) {
+        if inner.data_channel.send(buf.to_vec()).is_err() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Channel closed"));
         }
 

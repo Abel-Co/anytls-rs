@@ -67,7 +67,7 @@ async fn send_authentication(
     padding: Arc<PaddingFactory>,
 ) -> io::Result<()> {
     let padding_sizes = padding.generate_record_payload_sizes(0);
-    let padding_length = padding_sizes.get(0).copied().unwrap_or(30) as u16;
+    let padding_length = padding_sizes.first().copied().unwrap_or(30) as u16;
     let padding_data = padding.rng_vec(padding_length as usize);
 
     let mut auth_request = BytesMut::with_capacity(32 + 2 + padding_length as usize);

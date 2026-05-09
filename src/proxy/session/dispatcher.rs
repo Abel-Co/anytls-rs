@@ -110,8 +110,7 @@ impl Session {
             return Ok(());
         }
         let alert_msg = String::from_utf8_lossy(&data);
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             format!("Alert received: {}", alert_msg),
         ))
     }
@@ -138,7 +137,7 @@ impl Session {
         if let Some(padding_md5) = settings.get("padding-md5") {
             if padding_md5 != self.padding.md5() {
                 let raw_scheme = self.padding.raw_scheme.clone();
-                let frame = Frame::with_data(CMD_UPDATE_PADDING_SCHEME, 0, Bytes::from(raw_scheme));
+                let frame = Frame::with_data(CMD_UPDATE_PADDING_SCHEME, 0, raw_scheme);
                 self.write_control_frame(frame).await?;
             }
         }

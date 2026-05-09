@@ -97,7 +97,7 @@ impl Session {
 
         let mut writer_rx =
             self.frame_rx.lock().await.take().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "writer loop already started")
+                io::Error::other("writer loop already started")
             })?;
 
         let writer_session = Arc::clone(self);
