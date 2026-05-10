@@ -98,7 +98,7 @@ impl Session {
         }
         if self.streams.read().await.get(&sid).is_some() && !data.is_empty() {
             let error_msg = String::from_utf8_lossy(&data);
-            log::error!("Stream {} open failed: {}", sid, error_msg);
+            log::warn!("Stream {} open failed: {}", sid, error_msg);
         }
         Ok(())
     }
