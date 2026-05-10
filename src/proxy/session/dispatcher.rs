@@ -8,6 +8,7 @@ use crate::util::string_map::{StringMap, StringMapExt};
 use bytes::Bytes;
 use std::io;
 use std::sync::atomic::Ordering;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
 impl Session {
@@ -33,10 +34,22 @@ impl Session {
         if data.is_empty() {
             return Ok(());
         }
-        let streams = self.streams.read().await;
-        if let Some(stream_tx) = streams.get(&sid) {
-            if stream_tx.try_send(data).is_err() {
-                log::warn!("[Session] Failed to send data to stream {}: channel full", sid);
+        let stream_tx = {
+            let streams = self.streams.read().await;
+            streams.get(&sid).cloned()
+        };
+
+        if let Some(stream_tx) = stream_tx {
+            match stream_tx.try_send(data) {
+                Ok(()) => {}
+                Err(TrySendError::Full(data)) => {
+                    if stream_tx.send(data).await.is_err() {
+                        log::debug!("[Session] Stream {} closed while backpressure waiting", sid);
+                    }
+                }
+                Err(TrySendError::Closed(_)) => {
+                    log::debug!("[Session] Stream {} already closed", sid);
+                }
             }
         }
         Ok(())
