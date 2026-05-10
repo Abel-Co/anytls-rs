@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["anytls-rs contributors"]
 description = "A proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem"
 license = "MIT"
-repository = "https://github.com/anytls/anytls-rs"
+repository = "https://github.com/Abel-Co/anytls-rs"
 keywords = ["proxy", "tls", "privacy", "networking"]
 categories = ["network-programming", "command-line-utilities"]
 
