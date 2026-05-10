@@ -9,6 +9,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
+type PendingFrameSend = Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>;
+
 /// Stream 实现 AsyncRead 和 AsyncWrite，提供读写缓冲区
 pub struct Stream {
     pub id: u32,
@@ -30,9 +32,9 @@ pub struct Stream {
     close_tx: Option<oneshot::Sender<()>>,
 
     // 异步发送状态（用于正确处理背压）
-    pending_send: Option<Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>>,
+    pending_send: Option<PendingFrameSend>,
     pending_send_len: usize,
-    pending_shutdown: Option<Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>>,
+    pending_shutdown: Option<PendingFrameSend>,
 }
 
 impl Stream {
