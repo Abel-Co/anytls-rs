@@ -1,6 +1,6 @@
 [package]
 name = "anytls-rs"
-version = "0.0.8"
+version = "0.0.11"
 edition = "2021"
 authors = ["anytls-rs contributors"]
 description = "A proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem"
