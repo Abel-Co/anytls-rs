@@ -1,7 +1,7 @@
 use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::{Session, Stream};
 use crate::util::r#type::DialOutFunc;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,6 +13,63 @@ struct IdleEntry {
     idle_since_ms: u64,
 }
 
+struct IdlePool {
+    entries: HashMap<usize, IdleEntry>,
+    order: VecDeque<usize>,
+}
+
+impl IdlePool {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn insert_or_refresh(&mut self, session: Arc<Session>, idle_since_ms: u64) {
+        let key = session_key(&session);
+        if self.entries.contains_key(&key) {
+            self.order.retain(|k| *k != key);
+        }
+        self.entries.insert(key, IdleEntry { session, idle_since_ms });
+        self.order.push_back(key);
+    }
+
+    fn pop_back(&mut self) -> Option<IdleEntry> {
+        while let Some(key) = self.order.pop_back() {
+            if let Some(entry) = self.entries.remove(&key) {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    fn pop_front(&mut self) -> Option<IdleEntry> {
+        while let Some(key) = self.order.pop_front() {
+            if let Some(entry) = self.entries.remove(&key) {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    fn truncate_to(&mut self, keep: usize) -> Vec<Arc<Session>> {
+        let mut removed = Vec::new();
+        while self.len() > keep {
+            if let Some(entry) = self.pop_front() {
+                removed.push(entry.session);
+            } else {
+                break;
+            }
+        }
+        removed
+    }
+}
+
 /// 客户端连接管理器，实现连接复用
 pub struct Client {
     // 连接函数
@@ -21,8 +78,8 @@ pub struct Client {
     // 填充工厂
     padding: Arc<PaddingFactory>,
 
-    // 空闲 Session 管理
-    idle_sessions: Arc<Mutex<VecDeque<IdleEntry>>>,
+    // 空闲 Session 管理（按 session 唯一键去重）
+    idle_sessions: Arc<Mutex<IdlePool>>,
 
     // 配置
     idle_timeout: Duration,
@@ -43,7 +100,7 @@ impl Client {
         let client = Self {
             dial_out,
             padding,
-            idle_sessions: Arc::new(Mutex::new(VecDeque::new())),
+            idle_sessions: Arc::new(Mutex::new(IdlePool::new())),
             idle_timeout,
             min_idle_sessions,
             closed: Arc::new(AtomicBool::new(false)),
@@ -61,18 +118,23 @@ impl Client {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Client closed"));
         }
 
-        // 尝试获取空闲的 Session
-        if let Some(session) = self.get_idle_session().await {
+        let session = if let Some(session) = self.get_idle_session().await {
             log::debug!("Reusing idle session");
-            let stream = session.open_stream().await?;
-            return Ok((session, stream));
-        }
+            session
+        } else {
+            let session = self.create_session().await?;
+            log::debug!("Created new session");
+            session
+        };
 
-        // 创建新的 Session
-        let session = self.create_session().await?;
-        log::debug!("Created new session");
-
-        let stream = session.open_stream().await?;
+        let mut stream = session.open_stream().await?;
+        let this = self.clone();
+        let session_for_hook = Arc::clone(&session);
+        stream.set_on_close(Box::new(move || {
+            tokio::spawn(async move {
+                this.return_session_to_idle(session_for_hook).await;
+            });
+        }));
         Ok((session, stream))
     }
 
@@ -111,15 +173,9 @@ impl Client {
 
     /// 创建新的 Session
     async fn create_session(&self) -> io::Result<Arc<Session>> {
-        // 建立连接
         let conn = (self.dial_out)().await?;
-
-        // 创建 Session
         let session = Arc::new(Session::new_client(conn, self.padding.clone()));
-
-        // 启动 Session（同步等待 run 完成，run 内部会自行启动接收循环）
         session.run().await?;
-
         Ok(session)
     }
 
@@ -130,14 +186,15 @@ impl Client {
         }
 
         let mut idle_sessions = self.idle_sessions.lock().await;
-        idle_sessions.push_back(IdleEntry {
-            session,
-            idle_since_ms: now_unix_ms(),
-        });
+        idle_sessions.insert_or_refresh(session, now_unix_ms());
 
-        // 保持最小空闲 Session 数量
         if idle_sessions.len() > self.min_idle_sessions * 2 {
-            idle_sessions.truncate(self.min_idle_sessions);
+            let to_close = idle_sessions.truncate_to(self.min_idle_sessions);
+            drop(idle_sessions);
+            for session in to_close {
+                let _ = session.close().await;
+            }
+            return;
         }
 
         log::debug!("Session returned to idle pool");
@@ -146,7 +203,7 @@ impl Client {
     /// 启动定期清理任务
     fn start_cleanup_task(&self) {
         let client = self.clone();
-        let cleanup_interval = Duration::from_secs(30); // 每30秒清理一次
+        let cleanup_interval = Duration::from_secs(30);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(cleanup_interval);
@@ -184,7 +241,7 @@ impl Client {
                 break;
             }
             match self.create_session().await {
-                Ok(session) => self.return_to_idle(session).await,
+                Ok(session) => self.return_session_to_idle(session).await,
                 Err(e) => {
                     log::debug!("Prewarm session failed: {}", e);
                     break;
@@ -202,9 +259,8 @@ impl Client {
             let timeout_ms = self.idle_timeout.as_millis() as u64;
             let keep_min = self.min_idle_sessions;
 
-            // 仅在超过 min_idle 时，清理超时/已关闭项
             let mut kept = 0usize;
-            let mut rebuilt = VecDeque::with_capacity(idle_sessions.len());
+            let mut survivors: Vec<IdleEntry> = Vec::with_capacity(idle_sessions.len());
             while let Some(entry) = idle_sessions.pop_front() {
                 if entry.session.is_closed() {
                     continue;
@@ -215,9 +271,12 @@ impl Client {
                     continue;
                 }
                 kept += 1;
-                rebuilt.push_back(entry);
+                survivors.push(entry);
             }
-            *idle_sessions = rebuilt;
+
+            for entry in survivors {
+                idle_sessions.insert_or_refresh(entry.session, entry.idle_since_ms);
+            }
 
             if idle_sessions.len() > keep_min {
                 let excess = idle_sessions.len() - keep_min;
@@ -240,10 +299,15 @@ impl Client {
             return Ok(());
         }
 
-        // 清空空闲 Session
         let mut idle_sessions = self.idle_sessions.lock().await;
-        for entry in idle_sessions.drain(..) {
-            entry.session.close().await.ok();
+        let mut to_close = Vec::new();
+        while let Some(entry) = idle_sessions.pop_front() {
+            to_close.push(entry.session);
+        }
+        drop(idle_sessions);
+
+        for session in to_close {
+            session.close().await.ok();
         }
 
         Ok(())
@@ -255,6 +319,10 @@ fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn session_key(session: &Arc<Session>) -> usize {
+    Arc::as_ptr(session) as usize
 }
 
 impl Clone for Client {

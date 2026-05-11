@@ -35,6 +35,7 @@ pub struct Stream {
     pending_send: Option<PendingFrameSend>,
     pending_send_len: usize,
     pending_shutdown: Option<PendingFrameSend>,
+    on_close: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl Stream {
@@ -55,7 +56,12 @@ impl Stream {
             pending_send: None,
             pending_send_len: 0,
             pending_shutdown: None,
+            on_close: None,
         }
+    }
+
+    pub fn set_on_close(&mut self, on_close: Box<dyn FnOnce() + Send + 'static>) {
+        self.on_close = Some(on_close);
     }
 
     /// 检查是否已关闭
@@ -68,6 +74,9 @@ impl Stream {
         self.closed.store(true, Ordering::Release);
         if let Some(tx) = self.close_tx.take() {
             let _ = tx.send(());
+        }
+        if let Some(on_close) = self.on_close.take() {
+            on_close();
         }
     }
 
