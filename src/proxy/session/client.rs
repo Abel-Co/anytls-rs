@@ -1,7 +1,7 @@
 use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::{Session, Stream};
 use crate::util::r#type::DialOutFunc;
-use std::collections::{HashMap, VecDeque};
+use linked_hash_map::LinkedHashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,47 +14,33 @@ struct IdleEntry {
 }
 
 struct IdlePool {
-    entries: HashMap<usize, IdleEntry>,
-    order: VecDeque<usize>,
+    entries: LinkedHashMap<usize, IdleEntry>,
 }
 
 impl IdlePool {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
+            entries: LinkedHashMap::new(),
         }
     }
 
     fn len(&self) -> usize {
-        self.order.len()
+        self.entries.len()
     }
 
     fn insert_or_refresh(&mut self, session: Arc<Session>, idle_since_ms: u64) {
         let key = session_key(&session);
-        if self.entries.contains_key(&key) {
-            self.order.retain(|k| *k != key);
-        }
+        // Keep insertion order by removing old key first, then appending.
+        let _ = self.entries.remove(&key);
         self.entries.insert(key, IdleEntry { session, idle_since_ms });
-        self.order.push_back(key);
     }
 
     fn pop_back(&mut self) -> Option<IdleEntry> {
-        while let Some(key) = self.order.pop_back() {
-            if let Some(entry) = self.entries.remove(&key) {
-                return Some(entry);
-            }
-        }
-        None
+        self.entries.pop_back().map(|(_, entry)| entry)
     }
 
     fn pop_front(&mut self) -> Option<IdleEntry> {
-        while let Some(key) = self.order.pop_front() {
-            if let Some(entry) = self.entries.remove(&key) {
-                return Some(entry);
-            }
-        }
-        None
+        self.entries.pop_front().map(|(_, entry)| entry)
     }
 
     fn truncate_to(&mut self, keep: usize) -> Vec<Arc<Session>> {
@@ -113,7 +99,7 @@ impl Client {
     }
 
     /// 创建新的 Stream
-    pub async fn create_stream(&self) -> io::Result<(Arc<Session>, Stream)> {
+    pub async fn create_stream(&self) -> io::Result<Stream> {
         if self.closed.load(Ordering::Acquire) {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Client closed"));
         }
@@ -135,7 +121,7 @@ impl Client {
                 this.return_session_to_idle(session_for_hook).await;
             });
         }));
-        Ok((session, stream))
+        Ok(stream)
     }
 
     /// 手动将 Session 放回空闲池（由外部调用）

@@ -14,7 +14,7 @@ pub async fn handle_client_connection(
     info!("[Client] Connecting to {}:{}", req.host, req.port);
 
     log::debug!("[Client] Creating AnyTLS stream");
-    let (session, mut anytls_stream) = client.create_stream().await?;
+    let mut anytls_stream = client.create_stream().await?;
     log::info!("[Client] AnyTLS stream created successfully");
 
     let target_socks_addr = socks5::build_socks_addr(&req)?;
@@ -48,10 +48,6 @@ pub async fn handle_client_connection(
     };
 
     tokio::join!(client_to_target, target_to_client);
-
-    if !session.is_closed() {
-        client.return_session_to_idle(session).await;
-    }
 
     Ok(())
 }
