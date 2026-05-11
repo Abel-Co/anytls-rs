@@ -3,11 +3,11 @@ use std::io;
 use tokio::io::AsyncReadExt;
 use tokio_rustls::server::TlsStream;
 
-pub fn password_sha256(password: &str) -> [u8; 32] {
+pub(crate) fn password_sha256(password: &str) -> [u8; 32] {
     Sha256::digest(password.as_bytes()).into()
 }
 
-pub async fn authenticate(
+pub(crate) async fn authenticate(
     tls_stream: &mut TlsStream<tokio::net::TcpStream>,
     expected_password: [u8; 32],
 ) -> io::Result<bool> {
