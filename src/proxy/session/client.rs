@@ -117,16 +117,11 @@ impl Client {
         let this = self.clone();
         let session_for_hook = Arc::clone(&session);
         stream.set_on_close(Box::new(move || {
-            tokio::spawn(async move {
-                this.return_session_to_idle(session_for_hook).await;
-            });
-        }));
+                tokio::spawn(async move {
+                    this.return_to_idle(session_for_hook).await;
+                });
+            }));
         Ok(stream)
-    }
-
-    /// 手动将 Session 放回空闲池（由外部调用）
-    pub async fn return_session_to_idle(&self, session: Arc<Session>) {
-        self.return_to_idle(session).await;
     }
 
     /// 获取空闲的 Session
@@ -227,7 +222,7 @@ impl Client {
                 break;
             }
             match self.create_session().await {
-                Ok(session) => self.return_session_to_idle(session).await,
+                Ok(session) => self.return_to_idle(session).await,
                 Err(e) => {
                     log::debug!("Prewarm session failed: {}", e);
                     break;
