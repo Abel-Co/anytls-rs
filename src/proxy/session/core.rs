@@ -95,12 +95,10 @@ impl Session {
             log::info!("[Session] Client settings sent");
         }
 
-        let mut writer_rx = self
-            .frame_rx
-            .lock()
-            .await
-            .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer loop already started"))?;
+        let mut writer_rx =
+            self.frame_rx.lock().await.take().ok_or_else(|| {
+                io::Error::other("writer loop already started")
+            })?;
 
         let writer_session = Arc::clone(self);
         tokio::spawn(async move {
@@ -177,9 +175,9 @@ impl Session {
         let frame = Frame::with_data(CMD_SETTINGS, 0, Bytes::from(settings.to_bytes()));
         let data = frame.to_bytes();
         let mut conn_guard = self.conn_w.lock().await;
-        let conn = conn_guard
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed"))?;
+        let conn = conn_guard.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed")
+        })?;
         conn.write_all(&data).await?;
         Ok(())
     }

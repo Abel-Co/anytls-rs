@@ -1,17 +1,17 @@
 [package]
 name = "anytls-rs"
-version = "0.0.8"
+version = "0.0.11"
 edition = "2021"
 authors = ["anytls-rs contributors"]
 description = "A proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem"
 license = "MIT"
-repository = "https://github.com/anytls/anytls-rs"
+repository = "https://github.com/Abel-Co/anytls-rs"
 keywords = ["proxy", "tls", "privacy", "networking"]
 categories = ["network-programming", "command-line-utilities"]
 
 [profile.release]
 opt-level = 3          # 最高级别速度优化
-lto = "fat"            # 链接时优化，平衡性能与编译时间
+lto = "fat"            # 全程序、链接时优化
 codegen-units = 1      # 最大化优化机会，提升性能
 panic = "abort"        # 移除panic展开代码，提升性能并减小体积
 strip = true           # 剥离符号信息，减小发布体积，不影响性能
@@ -26,10 +26,9 @@ path = "src/bin/server/main.rs"
 
 [dependencies]
 tokio = { version = "1.47", features = ["full"] }
-tokio-rustls = "0.26"
-rustls = "0.23"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = "0.14"
-anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
@@ -38,8 +37,4 @@ sha2 = "0.10"
 rand = "0.8"
 fastrand = "2.0"
 bytes = "1.0"
-bincode = { version = "2.0", optional = true }
-
-[features]
-depth = ["bincode"]
-
+linked-hash-map = "0.5"

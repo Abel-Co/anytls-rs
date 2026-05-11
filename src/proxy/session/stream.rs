@@ -1,38 +1,41 @@
-use crate::proxy::session::frame::{Frame, CMD_PSH, CMD_FIN};
+use crate::proxy::session::frame::{Frame, CMD_FIN, CMD_PSH};
 use bytes::Bytes;
-use std::io;
 use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
-use std::pin::Pin;
-use std::task::{Context, Poll};
+
+type PendingFrameSend = Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>;
 
 /// Stream 实现 AsyncRead 和 AsyncWrite，提供读写缓冲区
 pub struct Stream {
     pub id: u32,
-    
+
     // 用于从 session 读取数据
     rx: mpsc::Receiver<Bytes>,
-    
+
     // 用于向 session 写入帧
     frame_tx: mpsc::Sender<Frame>,
-    
+
     // 部分读取的缓冲区
     read_buffer: Option<Bytes>,
     read_offset: usize,
-    
+
     // Stream 状态
     closed: Arc<AtomicBool>,
-    
+
     // 用于通知 Stream 关闭
     close_tx: Option<oneshot::Sender<()>>,
 
     // 异步发送状态（用于正确处理背压）
-    pending_send: Option<Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>>,
+    pending_send: Option<PendingFrameSend>,
     pending_send_len: usize,
-    pending_shutdown: Option<Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>>,
+    pending_shutdown: Option<PendingFrameSend>,
+    on_close: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl Stream {
@@ -53,10 +56,14 @@ impl Stream {
             pending_send: None,
             pending_send_len: 0,
             pending_shutdown: None,
+            on_close: None,
         }
     }
 
-  
+    pub fn set_on_close(&mut self, on_close: Box<dyn FnOnce() + Send + 'static>) {
+        self.on_close = Some(on_close);
+    }
+
     /// 检查是否已关闭
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
@@ -68,6 +75,9 @@ impl Stream {
         if let Some(tx) = self.close_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(on_close) = self.on_close.take() {
+            on_close();
+        }
     }
 
     /// 分割 Stream 为读写两部分
@@ -75,7 +85,6 @@ impl Stream {
     pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
         tokio::io::split(self)
     }
-
 }
 
 impl AsyncRead for Stream {
@@ -88,7 +97,7 @@ impl AsyncRead for Stream {
             log::debug!("[Stream] Stream {} is closed, returning EOF", self.id);
             return Poll::Ready(Ok(()));
         }
-        
+
         // 首先尝试从现有缓冲区读取
         if let Some(data) = &self.read_buffer {
             let remaining = data.len() - self.read_offset;
@@ -97,7 +106,7 @@ impl AsyncRead for Stream {
             log::debug!("[Stream] Reading {} bytes from buffer for stream {} (remaining: {})", to_copy, self.id, remaining);
             
             buf.put_slice(&data[self.read_offset..self.read_offset + to_copy]);
-            
+
             let new_offset = self.read_offset + to_copy;
             if new_offset >= data.len() {
                 self.read_buffer = None;
@@ -105,27 +114,34 @@ impl AsyncRead for Stream {
             } else {
                 self.read_offset = new_offset;
             }
-            
+
             return Poll::Ready(Ok(()));
         }
-        
+
         // 尝试接收新数据
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
                 let data_len = data.len();
                 let to_copy = data_len.min(buf.remaining());
-                log::debug!("[Stream] Received {} bytes for stream {}, copying {}", 
-                           data_len, self.id, to_copy);
-                
+                log::debug!(
+                    "[Stream] Received {} bytes for stream {}, copying {}",
+                    data_len,
+                    self.id,
+                    to_copy
+                );
+
                 buf.put_slice(&data[..to_copy]);
-                
+
                 if to_copy < data_len {
                     self.read_buffer = Some(data);
                     self.read_offset = to_copy;
-                    log::debug!("[Stream] Buffered {} bytes for stream {}", 
-                               data_len - to_copy, self.id);
+                    log::debug!(
+                        "[Stream] Buffered {} bytes for stream {}",
+                        data_len - to_copy,
+                        self.id
+                    );
                 }
-                
+
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => {
@@ -180,11 +196,11 @@ impl AsyncWrite for Stream {
             Poll::Pending
         }
     }
-    
+
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
-    
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.is_closed() {
             return Poll::Ready(Ok(()));

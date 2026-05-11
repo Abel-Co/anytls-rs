@@ -6,29 +6,29 @@ use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 
 #[derive(Clone, Default)]
-pub struct SessionRegistry {
+pub(crate) struct SessionRegistry {
     inner: Arc<Mutex<HashMap<u64, Arc<Session>>>>,
 }
 
 impl SessionRegistry {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub async fn insert(&self, id: u64, session: Arc<Session>) {
+    pub(crate) async fn insert(&self, id: u64, session: Arc<Session>) {
         self.inner.lock().await.insert(id, session);
     }
 
-    pub async fn remove(&self, id: u64) {
+    pub(crate) async fn remove(&self, id: u64) {
         self.inner.lock().await.remove(&id);
     }
 
-    pub async fn snapshot(&self) -> Vec<(u64, Arc<Session>)> {
+    pub(crate) async fn snapshot(&self) -> Vec<(u64, Arc<Session>)> {
         let map = self.inner.lock().await;
         map.iter().map(|(k, v)| (*k, Arc::clone(v))).collect()
     }
 
-    pub fn make_on_close(&self, id: u64) -> Arc<dyn Fn() + Send + Sync> {
+    pub(crate) fn make_on_close(&self, id: u64) -> Arc<dyn Fn() + Send + Sync> {
         let registry = self.clone();
         Arc::new(move || {
             let registry = registry.clone();
@@ -38,7 +38,7 @@ impl SessionRegistry {
         })
     }
 
-    pub fn spawn_idle_cleanup(&self, idle_timeout_ms: u64, min_idle: usize) {
+    pub(crate) fn spawn_idle_cleanup(&self, idle_timeout_ms: u64, min_idle: usize) {
         let registry = self.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(30));

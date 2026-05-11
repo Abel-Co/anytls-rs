@@ -24,11 +24,11 @@ pub struct PipeInner {
 impl PipeReader {
     pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut inner = self.inner.lock().await;
-        
+
         if inner.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Pipe closed"));
         }
-        
+
         if let Some(ref mut receiver) = inner.data_receiver {
             if let Some(data) = receiver.recv().await {
                 let len = data.len().min(buf.len());
@@ -41,7 +41,7 @@ impl PipeReader {
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "No receiver"))
         }
     }
-    
+
     pub fn close_with_error(&self, error: Option<io::Error>) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
@@ -50,7 +50,7 @@ impl PipeReader {
             inner.closed = true;
         });
     }
-    
+
     pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
         let mut inner = self.inner.lock().await;
         inner.read_deadline.set(deadline);
@@ -61,18 +61,18 @@ impl PipeReader {
 impl PipeWriter {
     pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
         let inner = self.inner.lock().await;
-        
+
         if inner.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Pipe closed"));
         }
-        
-        if let Err(_) = inner.data_channel.send(buf.to_vec()) {
+
+        if inner.data_channel.send(buf.to_vec()).is_err() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Channel closed"));
         }
-        
+
         Ok(buf.len())
     }
-    
+
     pub fn close_with_error(&self, error: Option<io::Error>) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
@@ -81,7 +81,7 @@ impl PipeWriter {
             inner.closed = true;
         });
     }
-    
+
     pub async fn set_write_deadline(&self, deadline: std::time::SystemTime) -> io::Result<()> {
         let mut inner = self.inner.lock().await;
         inner.write_deadline.set(deadline);
@@ -91,7 +91,7 @@ impl PipeWriter {
 
 pub fn pipe() -> (PipeReader, PipeWriter) {
     let (tx, rx) = mpsc::unbounded_channel();
-    
+
     let inner = Arc::new(Mutex::new(PipeInner {
         read_deadline: PipeDeadline::new(),
         write_deadline: PipeDeadline::new(),
@@ -101,6 +101,6 @@ pub fn pipe() -> (PipeReader, PipeWriter) {
         data_channel: tx,
         data_receiver: Some(rx),
     }));
-    
+
     (PipeReader { inner: inner.clone() }, PipeWriter { inner })
 }
