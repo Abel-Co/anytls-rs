@@ -1,4 +1,5 @@
 use crate::proxy::padding::PaddingFactory;
+use crate::proxy::session::close_reason::is_expected_close_error;
 use crate::proxy::session::frame::{Frame, CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, HEADER_OVERHEAD_SIZE};
 use crate::proxy::session::stream::Stream;
 use crate::util::r#type::AsyncReadWrite;
@@ -108,7 +109,11 @@ impl Session {
         let recv_session = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(e) = recv_session.recv_loop().await {
-                log::error!("Session receive loop error: {}", e);
+                if is_expected_close_error(&e) {
+                    log::debug!("Session receive loop ended: {}", e);
+                } else {
+                    log::error!("Session receive loop error: {}", e);
+                }
             }
         });
         Ok(())

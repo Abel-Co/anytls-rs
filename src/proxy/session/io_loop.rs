@@ -1,4 +1,5 @@
 use super::core::Session;
+use super::close_reason::is_expected_close_error;
 use crate::proxy::session::frame::{Frame, RawHeader, CMD_WASTE, HEADER_OVERHEAD_SIZE};
 use bytes::{BufMut, BytesMut};
 use std::io;
@@ -16,7 +17,11 @@ impl Session {
                     match maybe_frame {
                         Some(frame) => {
                             if let Err(e) = self.write_frame(frame).await {
-                                log::error!("Session writer loop error: {}", e);
+                                if is_expected_close_error(&e) {
+                                    log::debug!("Session writer loop ended: {}", e);
+                                } else {
+                                    log::error!("Session writer loop error: {}", e);
+                                }
                                 break;
                             }
                         }
