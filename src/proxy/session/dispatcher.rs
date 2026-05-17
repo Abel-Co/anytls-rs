@@ -84,7 +84,7 @@ impl Session {
             streams.remove(&sid);
             return Ok(());
         }
-        log::info!("Stream {} opened successfully", sid);
+        log::debug!("Stream {} opened successfully", sid);
         if let Some(cb) = &self.on_new_stream {
             cb(stream);
         }

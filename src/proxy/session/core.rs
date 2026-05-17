@@ -74,10 +74,10 @@ impl Session {
 
     /// 启动 Session。采用“后台循环 + 立即返回”的模型。
     pub async fn run(self: &Arc<Self>) -> io::Result<()> {
-        log::info!("[Session] Starting session (client: {})", self.is_client);
+        log::debug!("[Session] Starting session (client: {})", self.is_client);
         if self.is_client {
             self.send_client_settings().await?;
-            log::info!("[Session] Client settings sent");
+            log::debug!("[Session] Client settings sent");
         }
 
         let mut writer_rx =
