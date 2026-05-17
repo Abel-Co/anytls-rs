@@ -2,9 +2,10 @@ use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::{Session, Stream};
 use crate::util::r#type::DialOutFunc;
 use linked_hash_map::LinkedHashMap;
+use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 
@@ -30,7 +31,6 @@ impl IdlePool {
 
     fn insert_or_refresh(&mut self, session: Arc<Session>, idle_since_ms: u64) {
         let key = session_key(&session);
-        // Keep insertion order by removing old key first, then appending.
         let _ = self.entries.remove(&key);
         self.entries.insert(key, IdleEntry { session, idle_since_ms });
     }
@@ -56,53 +56,94 @@ impl IdlePool {
     }
 }
 
-/// 客户端连接管理器，实现连接复用
+struct ReturnEvent {
+    client: Client,
+    session: Arc<Session>,
+}
+
+struct GlobalControl {
+    clients: Arc<Mutex<HashMap<usize, Client>>>,
+    return_tx: mpsc::Sender<ReturnEvent>,
+}
+
+static GLOBAL_CONTROL: OnceLock<GlobalControl> = OnceLock::new();
+static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
+
+fn global_control() -> &'static GlobalControl {
+    GLOBAL_CONTROL.get_or_init(|| {
+        let clients = Arc::new(Mutex::new(HashMap::<usize, Client>::new()));
+        let (return_tx, mut return_rx) = mpsc::channel::<ReturnEvent>(4096);
+
+        tokio::spawn(async move {
+            while let Some(ev) = return_rx.recv().await {
+                if ev.client.closed.load(Ordering::Acquire) {
+                    continue;
+                }
+                ev.client.return_to_idle(ev.session).await;
+            }
+        });
+
+        let cleanup_clients = Arc::clone(&clients);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let snapshot = {
+                    let clients = cleanup_clients.lock().await;
+                    clients.values().cloned().collect::<Vec<_>>()
+                };
+
+                for client in snapshot {
+                    if client.closed.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    client.ensure_min_idle_sessions().await;
+                    client.cleanup_idle_sessions().await;
+                }
+            }
+        });
+
+        GlobalControl { clients, return_tx }
+    })
+}
+
 pub struct Client {
-    // 连接函数
+    id: usize,
     dial_out: DialOutFunc,
-
-    // 填充工厂
     padding: Arc<PaddingFactory>,
-
-    // 空闲 Session 管理（按 session 唯一键去重）
     idle_sessions: Arc<Mutex<IdlePool>>,
-    return_tx: mpsc::Sender<Arc<Session>>,
-
-    // 配置
     idle_timeout: Duration,
     min_idle_sessions: usize,
-
-    // 状态
     closed: Arc<AtomicBool>,
 }
 
 impl Client {
-    /// 创建新的客户端
     pub fn new(
         dial_out: DialOutFunc,
         padding: Arc<PaddingFactory>,
         idle_timeout: Duration,
         min_idle_sessions: usize,
     ) -> Self {
-        let (return_tx, return_rx) = mpsc::channel::<Arc<Session>>(1024);
         let client = Self {
+            id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
             dial_out,
             padding,
             idle_sessions: Arc::new(Mutex::new(IdlePool::new())),
-            return_tx,
             idle_timeout,
             min_idle_sessions,
             closed: Arc::new(AtomicBool::new(false)),
         };
-        client.start_return_worker(return_rx);
 
-        // 启动定期清理任务
-        client.start_cleanup_task();
+        let ctl = global_control();
+        let to_register = client.clone();
+        tokio::spawn(async move {
+            let mut clients = ctl.clients.lock().await;
+            clients.insert(to_register.id, to_register);
+        });
 
         client
     }
 
-    /// 创建新的 Stream
     pub async fn create_stream(&self) -> io::Result<Stream> {
         if self.closed.load(Ordering::Acquire) {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Client closed"));
@@ -121,12 +162,15 @@ impl Client {
         let this = self.clone();
         let session_for_hook = Arc::clone(&session);
         stream.set_on_close(Box::new(move || {
-            let _ = this.return_tx.try_send(session_for_hook);
+            let tx = &global_control().return_tx;
+            let _ = tx.try_send(ReturnEvent {
+                client: this.clone(),
+                session: Arc::clone(&session_for_hook),
+            });
         }));
         Ok(stream)
     }
 
-    /// 获取空闲的 Session
     async fn get_idle_session(&self) -> Option<Arc<Session>> {
         let mut to_close = Vec::new();
         let mut selected = None;
@@ -154,7 +198,6 @@ impl Client {
         selected
     }
 
-    /// 创建新的 Session
     async fn create_session(&self) -> io::Result<Arc<Session>> {
         let conn = (self.dial_out)().await?;
         let session = Arc::new(Session::new_client(conn, self.padding.clone()));
@@ -162,7 +205,6 @@ impl Client {
         Ok(session)
     }
 
-    /// 将 Session 放回空闲池
     async fn return_to_idle(&self, session: Arc<Session>) {
         if self.closed.load(Ordering::Acquire) {
             return;
@@ -183,40 +225,6 @@ impl Client {
         log::debug!("Session returned to idle pool");
     }
 
-    fn start_return_worker(&self, mut rx: mpsc::Receiver<Arc<Session>>) {
-        let client = self.clone();
-        tokio::spawn(async move {
-            while let Some(session) = rx.recv().await {
-                if client.closed.load(Ordering::Acquire) {
-                    break;
-                }
-                client.return_to_idle(session).await;
-            }
-        });
-    }
-
-    /// 启动定期清理任务
-    fn start_cleanup_task(&self) {
-        let client = self.clone();
-        let cleanup_interval = Duration::from_secs(30);
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(cleanup_interval);
-            loop {
-                interval.tick().await;
-
-                if client.closed.load(Ordering::Acquire) {
-                    break;
-                }
-
-                client.ensure_min_idle_sessions().await;
-                client.cleanup_idle_sessions().await;
-                log::debug!("Performed idle session cleanup");
-            }
-        });
-    }
-
-    /// 主动预热：保持至少 min_idle_sessions 个空闲会话
     async fn ensure_min_idle_sessions(&self) {
         if self.min_idle_sessions == 0 || self.closed.load(Ordering::Acquire) {
             return;
@@ -245,7 +253,6 @@ impl Client {
         }
     }
 
-    /// 清理空闲的 Session
     pub async fn cleanup_idle_sessions(&self) {
         let mut to_close = Vec::new();
         {
@@ -288,10 +295,15 @@ impl Client {
         }
     }
 
-    /// 关闭客户端
     pub async fn close(&self) -> io::Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+
+        {
+            let ctl = global_control();
+            let mut clients = ctl.clients.lock().await;
+            clients.remove(&self.id);
         }
 
         let mut idle_sessions = self.idle_sessions.lock().await;
@@ -323,10 +335,10 @@ fn session_key(session: &Arc<Session>) -> usize {
 impl Clone for Client {
     fn clone(&self) -> Self {
         Self {
+            id: self.id,
             dial_out: self.dial_out.clone(),
             padding: self.padding.clone(),
             idle_sessions: self.idle_sessions.clone(),
-            return_tx: self.return_tx.clone(),
             idle_timeout: self.idle_timeout,
             min_idle_sessions: self.min_idle_sessions,
             closed: self.closed.clone(),
