@@ -4,6 +4,7 @@ mod core;
 mod dispatcher;
 pub mod frame;
 mod io_loop;
+mod state;
 pub mod stream;
 
 pub use client::Client;

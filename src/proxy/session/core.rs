@@ -1,27 +1,23 @@
 use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::close_reason::is_expected_close_error;
 use crate::proxy::session::frame::{Frame, CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, HEADER_OVERHEAD_SIZE};
+use crate::proxy::session::state::SessionState;
 use crate::proxy::session::stream::Stream;
 use crate::util::r#type::AsyncReadWrite;
 use crate::util::string_map::{StringMap, StringMapExt};
 use bytes::Bytes;
-use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
 /// Session 管理多个 Stream 的连接复用
 pub struct Session {
+    pub(super) state: SessionState,
     pub(super) conn_r: Mutex<Option<ReadHalf<Box<dyn AsyncReadWrite>>>>,
     pub(super) conn_w: Mutex<Option<WriteHalf<Box<dyn AsyncReadWrite>>>>,
-    pub(super) streams: Arc<RwLock<HashMap<u32, mpsc::Sender<Bytes>>>>,
-    pub(super) next_stream_id: AtomicU32,
-    pub(super) closed: AtomicBool,
     pub(super) is_client: bool,
-    pub(super) peer_version: AtomicU32,
     pub(super) padding: Arc<PaddingFactory>,
     pub(super) pkt_counter: AtomicU32,
     pub(super) send_padding: AtomicBool,
@@ -30,8 +26,6 @@ pub struct Session {
     pub(super) close_notify: Notify,
     pub(super) on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
     pub(super) on_close: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub(super) stream_count: AtomicU32,
-    pub(super) last_active_unix_ms: AtomicU64,
 }
 
 impl Session {
@@ -39,13 +33,10 @@ impl Session {
         let (conn_r, conn_w) = tokio::io::split(conn);
         let (frame_tx, frame_rx) = mpsc::channel(1024);
         Self {
+            state: SessionState::new(),
             conn_r: Mutex::new(Some(conn_r)),
             conn_w: Mutex::new(Some(conn_w)),
-            streams: Arc::new(RwLock::new(HashMap::new())),
-            next_stream_id: AtomicU32::new(1),
-            closed: AtomicBool::new(false),
             is_client: true,
-            peer_version: AtomicU32::new(0),
             padding,
             pkt_counter: AtomicU32::new(0),
             send_padding: AtomicBool::new(true),
@@ -54,8 +45,6 @@ impl Session {
             close_notify: Notify::new(),
             on_new_stream: None,
             on_close: None,
-            stream_count: AtomicU32::new(0),
-            last_active_unix_ms: AtomicU64::new(now_unix_ms()),
         }
     }
 
@@ -68,13 +57,10 @@ impl Session {
         let (conn_r, conn_w) = tokio::io::split(conn);
         let (frame_tx, frame_rx) = mpsc::channel(1024);
         Self {
+            state: SessionState::new(),
             conn_r: Mutex::new(Some(conn_r)),
             conn_w: Mutex::new(Some(conn_w)),
-            streams: Arc::new(RwLock::new(HashMap::new())),
-            next_stream_id: AtomicU32::new(1),
-            closed: AtomicBool::new(false),
             is_client: false,
-            peer_version: AtomicU32::new(0),
             padding,
             pkt_counter: AtomicU32::new(0),
             send_padding: AtomicBool::new(false),
@@ -83,8 +69,6 @@ impl Session {
             close_notify: Notify::new(),
             on_new_stream,
             on_close,
-            stream_count: AtomicU32::new(0),
-            last_active_unix_ms: AtomicU64::new(now_unix_ms()),
         }
     }
 
@@ -125,16 +109,16 @@ impl Session {
         }
         self.touch_activity();
 
-        let stream_id = self.next_stream_id.fetch_add(1, Ordering::AcqRel);
+        let stream_id = self.state.next_stream_id.fetch_add(1, Ordering::AcqRel);
         let (data_tx, data_rx) = mpsc::channel(100);
         let (close_tx, _close_rx) = oneshot::channel();
         let stream = Stream::new(stream_id, data_rx, self.frame_tx.clone(), close_tx);
 
         {
-            let mut streams = self.streams.write().await;
+            let mut streams = self.state.streams.write().await;
             streams.insert(stream_id, data_tx);
         }
-        self.stream_count.fetch_add(1, Ordering::AcqRel);
+        self.state.stream_count.fetch_add(1, Ordering::AcqRel);
         self.write_control_frame(Frame::new(CMD_SYN, stream_id)).await?;
         log::debug!("[Session] SYN frame sent for stream {}", stream_id);
         Ok(stream)
@@ -142,9 +126,9 @@ impl Session {
 
     pub async fn close_stream(&self, stream_id: u32) -> io::Result<()> {
         {
-            let mut streams = self.streams.write().await;
+            let mut streams = self.state.streams.write().await;
             if streams.remove(&stream_id).is_some() {
-                self.stream_count.fetch_sub(1, Ordering::AcqRel);
+                self.state.stream_count.fetch_sub(1, Ordering::AcqRel);
             }
         }
         self.write_control_frame(Frame::new(CMD_FIN, stream_id)).await?;
@@ -188,19 +172,19 @@ impl Session {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.state.is_closed()
     }
 
     pub fn stream_count(&self) -> u32 {
-        self.stream_count.load(Ordering::Acquire)
+        self.state.stream_count()
     }
 
     pub fn last_active_unix_ms(&self) -> u64 {
-        self.last_active_unix_ms.load(Ordering::Acquire)
+        self.state.last_active_unix_ms()
     }
 
     pub async fn close(&self) -> io::Result<()> {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.state.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         self.close_notify.notify_waiters();
@@ -216,10 +200,10 @@ impl Session {
             let _ = r.take();
         }
         {
-            let mut streams = self.streams.write().await;
+            let mut streams = self.state.streams.write().await;
             streams.clear();
         }
-        self.stream_count.store(0, Ordering::Release);
+        self.state.stream_count.store(0, Ordering::Release);
         if let Some(cb) = &self.on_close {
             cb();
         }
@@ -227,13 +211,6 @@ impl Session {
     }
 
     pub(super) fn touch_activity(&self) {
-        self.last_active_unix_ms.store(now_unix_ms(), Ordering::Release);
+        self.state.touch_activity();
     }
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
