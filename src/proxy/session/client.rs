@@ -5,7 +5,7 @@ use linked_hash_map::LinkedHashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 
 struct IdleEntry {
@@ -66,6 +66,7 @@ pub struct Client {
 
     // 空闲 Session 管理（按 session 唯一键去重）
     idle_sessions: Arc<Mutex<IdlePool>>,
+    return_tx: mpsc::Sender<Arc<Session>>,
 
     // 配置
     idle_timeout: Duration,
@@ -83,14 +84,17 @@ impl Client {
         idle_timeout: Duration,
         min_idle_sessions: usize,
     ) -> Self {
+        let (return_tx, return_rx) = mpsc::channel::<Arc<Session>>(1024);
         let client = Self {
             dial_out,
             padding,
             idle_sessions: Arc::new(Mutex::new(IdlePool::new())),
+            return_tx,
             idle_timeout,
             min_idle_sessions,
             closed: Arc::new(AtomicBool::new(false)),
         };
+        client.start_return_worker(return_rx);
 
         // 启动定期清理任务
         client.start_cleanup_task();
@@ -117,10 +121,8 @@ impl Client {
         let this = self.clone();
         let session_for_hook = Arc::clone(&session);
         stream.set_on_close(Box::new(move || {
-                tokio::spawn(async move {
-                    this.return_to_idle(session_for_hook).await;
-                });
-            }));
+            let _ = this.return_tx.try_send(session_for_hook);
+        }));
         Ok(stream)
     }
 
@@ -179,6 +181,18 @@ impl Client {
         }
 
         log::debug!("Session returned to idle pool");
+    }
+
+    fn start_return_worker(&self, mut rx: mpsc::Receiver<Arc<Session>>) {
+        let client = self.clone();
+        tokio::spawn(async move {
+            while let Some(session) = rx.recv().await {
+                if client.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                client.return_to_idle(session).await;
+            }
+        });
     }
 
     /// 启动定期清理任务
@@ -312,6 +326,7 @@ impl Clone for Client {
             dial_out: self.dial_out.clone(),
             padding: self.padding.clone(),
             idle_sessions: self.idle_sessions.clone(),
+            return_tx: self.return_tx.clone(),
             idle_timeout: self.idle_timeout,
             min_idle_sessions: self.min_idle_sessions,
             closed: self.closed.clone(),
