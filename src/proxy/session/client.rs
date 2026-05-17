@@ -73,33 +73,36 @@ fn global_control() -> &'static GlobalControl {
     GLOBAL_CONTROL.get_or_init(|| {
         let clients = Arc::new(Mutex::new(HashMap::<usize, Client>::new()));
         let (return_tx, mut return_rx) = mpsc::channel::<ReturnEvent>(4096);
-
-        tokio::spawn(async move {
-            while let Some(ev) = return_rx.recv().await {
-                if ev.client.closed.load(Ordering::Acquire) {
-                    continue;
-                }
-                ev.client.return_to_idle(ev.session).await;
-            }
-        });
-
         let cleanup_clients = Arc::clone(&clients);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
-                interval.tick().await;
-                let snapshot = {
-                    let clients = cleanup_clients.lock().await;
-                    clients.values().cloned().collect::<Vec<_>>()
-                };
-
-                for client in snapshot {
-                    if client.closed.load(Ordering::Acquire) {
-                        continue;
+                tokio::select! {
+                    maybe_ev = return_rx.recv() => {
+                        let Some(ev) = maybe_ev else {
+                            break;
+                        };
+                        if ev.client.closed.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        ev.client.return_to_idle(ev.session).await;
                     }
-                    client.ensure_min_idle_sessions().await;
-                    client.cleanup_idle_sessions().await;
+                    _ = interval.tick() => {
+                        let snapshot = {
+                            let clients = cleanup_clients.lock().await;
+                            clients.values().cloned().collect::<Vec<_>>()
+                        };
+
+                        for client in snapshot {
+                            if client.closed.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            client.ensure_min_idle_sessions().await;
+                            client.cleanup_idle_sessions().await;
+                        }
+                    }
                 }
+
             }
         });
 
