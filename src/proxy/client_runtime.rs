@@ -2,6 +2,7 @@ use crate::proxy::session::Client;
 use crate::proxy::socks5;
 use log::{error, info};
 use tokio::io::AsyncWriteExt;
+use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
 
 pub async fn handle_client_connection(
@@ -30,24 +31,17 @@ pub async fn handle_client_connection(
     socks5::write_success_reply(&mut client_conn).await?;
     log::debug!("[Client] Sent SOCKS5 connection success response");
 
-    let (mut client_read, mut client_write) = client_conn.split();
-    let (mut anytls_read, mut anytls_write) = anytls_stream.split();
-
-    let client_to_target = async move {
-        match tokio::io::copy(&mut client_read, &mut anytls_write).await {
-            Ok(bytes) => info!("[Client] Client to target copy completed: {} bytes", bytes),
-            Err(e) => error!("[Client] Client to target copy error: {}", e),
+    match copy_bidirectional(&mut client_conn, &mut anytls_stream).await {
+        Ok((c2t, t2c)) => {
+            info!(
+                "[Client] Bidirectional copy completed: client->target={} bytes, target->client={} bytes",
+                c2t, t2c
+            );
         }
-    };
-
-    let target_to_client = async move {
-        match tokio::io::copy(&mut anytls_read, &mut client_write).await {
-            Ok(bytes) => info!("[Client] Target to client copy completed: {} bytes", bytes),
-            Err(e) => error!("[Client] Target to client copy error: {}", e),
+        Err(e) => {
+            error!("[Client] Bidirectional copy error: {}", e);
         }
-    };
-
-    tokio::join!(client_to_target, target_to_client);
+    }
 
     Ok(())
 }
