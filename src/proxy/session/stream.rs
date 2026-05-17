@@ -94,7 +94,6 @@ impl AsyncRead for Stream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         if self.is_closed() {
-            log::debug!("[Stream] Stream {} is closed, returning EOF", self.id);
             return Poll::Ready(Ok(()));
         }
 
@@ -102,8 +101,6 @@ impl AsyncRead for Stream {
         if let Some(data) = &self.read_buffer {
             let remaining = data.len() - self.read_offset;
             let to_copy = remaining.min(buf.remaining());
-            
-            log::debug!("[Stream] Reading {} bytes from buffer for stream {} (remaining: {})", to_copy, self.id, remaining);
             
             buf.put_slice(&data[self.read_offset..self.read_offset + to_copy]);
 
@@ -123,29 +120,16 @@ impl AsyncRead for Stream {
             Poll::Ready(Some(data)) => {
                 let data_len = data.len();
                 let to_copy = data_len.min(buf.remaining());
-                log::debug!(
-                    "[Stream] Received {} bytes for stream {}, copying {}",
-                    data_len,
-                    self.id,
-                    to_copy
-                );
-
                 buf.put_slice(&data[..to_copy]);
 
                 if to_copy < data_len {
                     self.read_buffer = Some(data);
                     self.read_offset = to_copy;
-                    log::debug!(
-                        "[Stream] Buffered {} bytes for stream {}",
-                        data_len - to_copy,
-                        self.id
-                    );
                 }
 
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => {
-                log::debug!("[Stream] Channel closed for stream {}, marking as closed", self.id);
                 self.mark_closed();
                 Poll::Ready(Ok(()))
             }
@@ -157,7 +141,6 @@ impl AsyncRead for Stream {
 impl AsyncWrite for Stream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         if self.is_closed() {
-            log::debug!("[Stream] Stream {} is closed, write failed", self.id);
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stream is closed",
@@ -165,7 +148,6 @@ impl AsyncWrite for Stream {
         }
 
         if self.pending_send.is_none() {
-            log::debug!("[Stream] Writing {} bytes to stream {}", buf.len(), self.id);
             let frame = Frame::with_data(CMD_PSH, self.id, Bytes::copy_from_slice(buf));
             let tx = self.frame_tx.clone();
             self.pending_send = Some(Box::pin(async move { tx.send(frame).await }));
@@ -178,13 +160,11 @@ impl AsyncWrite for Stream {
                     let n = self.pending_send_len;
                     self.pending_send = None;
                     self.pending_send_len = 0;
-                    log::debug!("[Stream] Successfully queued {} bytes for stream {}", n, self.id);
                     Poll::Ready(Ok(n))
                 }
                 Poll::Ready(Err(_)) => {
                     self.pending_send = None;
                     self.pending_send_len = 0;
-                    log::debug!("[Stream] Channel closed for stream {}, write failed", self.id);
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "session is closed",
