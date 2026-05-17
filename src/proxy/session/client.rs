@@ -5,7 +5,7 @@ use linked_hash_map::LinkedHashMap;
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 
@@ -62,7 +62,7 @@ struct ReturnEvent {
 }
 
 struct GlobalControl {
-    clients: Arc<Mutex<HashMap<usize, Client>>>,
+    clients: Arc<StdMutex<HashMap<usize, Client>>>,
     return_tx: mpsc::Sender<ReturnEvent>,
 }
 
@@ -71,7 +71,7 @@ static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn global_control() -> &'static GlobalControl {
     GLOBAL_CONTROL.get_or_init(|| {
-        let clients = Arc::new(Mutex::new(HashMap::<usize, Client>::new()));
+        let clients = Arc::new(StdMutex::new(HashMap::<usize, Client>::new()));
         let (return_tx, mut return_rx) = mpsc::channel::<ReturnEvent>(4096);
         let cleanup_clients = Arc::clone(&clients);
         tokio::spawn(async move {
@@ -89,7 +89,9 @@ fn global_control() -> &'static GlobalControl {
                     }
                     _ = interval.tick() => {
                         let snapshot = {
-                            let clients = cleanup_clients.lock().await;
+                            let clients = cleanup_clients
+                                .lock()
+                                .expect("global anytls-rs clients lock poisoned");
                             clients.values().cloned().collect::<Vec<_>>()
                         };
 
@@ -138,11 +140,11 @@ impl Client {
         };
 
         let ctl = global_control();
-        let to_register = client.clone();
-        tokio::spawn(async move {
-            let mut clients = ctl.clients.lock().await;
-            clients.insert(to_register.id, to_register);
-        });
+        let mut clients = ctl
+            .clients
+            .lock()
+            .expect("global anytls-rs clients lock poisoned");
+        clients.insert(client.id, client.clone());
 
         client
     }
@@ -305,7 +307,10 @@ impl Client {
 
         {
             let ctl = global_control();
-            let mut clients = ctl.clients.lock().await;
+            let mut clients = ctl
+                .clients
+                .lock()
+                .expect("global anytls-rs clients lock poisoned");
             clients.remove(&self.id);
         }
 
