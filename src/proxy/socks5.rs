@@ -5,7 +5,8 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Clone)]
-pub struct ConnectRequest {
+pub struct SocksRequest {
+    pub command: u8,
     pub atyp: AddressType,
     pub host: String,
     pub port: u16,
@@ -34,7 +35,7 @@ where
     Ok(())
 }
 
-pub async fn read_connect_request<S>(stream: &mut S) -> io::Result<ConnectRequest>
+pub async fn read_request<S>(stream: &mut S) -> io::Result<SocksRequest>
 where
     S: AsyncRead + Unpin,
 {
@@ -43,7 +44,8 @@ where
     if head[0] != 0x05 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported SOCKS version"));
     }
-    if head[1] != 0x01 {
+    let command = head[1];
+    if command != 0x01 && command != 0x03 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported SOCKS command"));
     }
     match head[3] {
@@ -52,7 +54,8 @@ where
     }
 
     let addr = read_socks_addr_with_atyp(stream, head[3]).await?;
-    Ok(ConnectRequest {
+    Ok(SocksRequest {
+        command,
         atyp: addr.atyp,
         host: addr.host,
         port: addr.port,
@@ -67,12 +70,31 @@ where
     stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
 }
 
-pub fn build_socks_addr(req: &ConnectRequest) -> io::Result<Vec<u8>> {
+pub fn build_socks_addr(req: &SocksRequest) -> io::Result<Vec<u8>> {
     build_socks_addr_raw(&SocksAddr {
         atyp: req.atyp,
         host: req.host.clone(),
         port: req.port,
     })
+}
+
+pub async fn write_command_not_supported_reply<S>(stream: &mut S) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // VER=5 REP=7 command not supported RSV=0 ATYP=IPv4 BND.ADDR=0.0.0.0 BND.PORT=0
+    stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
+}
+
+pub async fn write_udp_associate_reply<S>(stream: &mut S, bind_port: u16) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let port = bind_port.to_be_bytes();
+    // VER=5 REP=0 RSV=0 ATYP=IPv4 BND.ADDR=0.0.0.0 BND.PORT=bind_port
+    stream
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, port[0], port[1]])
+        .await
 }
 
 #[cfg(test)]
@@ -81,7 +103,8 @@ mod tests {
 
     #[test]
     fn test_build_socks_addr_domain() {
-        let req = ConnectRequest {
+        let req = SocksRequest {
+            command: 0x01,
             atyp: AddressType::Domain,
             host: "www.google.com".to_string(),
             port: 443,
@@ -95,7 +118,8 @@ mod tests {
 
     #[test]
     fn test_build_socks_addr_ipv4() {
-        let req = ConnectRequest {
+        let req = SocksRequest {
+            command: 0x01,
             atyp: AddressType::Ipv4,
             host: "1.2.3.4".to_string(),
             port: 8080,
