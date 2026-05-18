@@ -36,7 +36,7 @@ pub fn create_dial_out_func(
         Box::new(Box::pin(async move {
             log::debug!("[Client] Connecting to AnyTLS server at {}", server_addr);
             let tcp_stream = TcpStream::connect(&server_addr).await?;
-            log::info!("[Client] TCP connection to AnyTLS server established");
+            log::debug!("[Client] TCP connection to AnyTLS server established");
 
             let server_name = sni.unwrap_or_else(|| "localhost".to_string());
             log::debug!("[Client] Using SNI: {}", server_name);
@@ -47,10 +47,10 @@ pub fn create_dial_out_func(
             let tls_connector = TlsConnector::from(tls_config);
             log::debug!("[Client] Starting TLS handshake");
             let mut tls_stream = tls_connector.connect(server_name, tcp_stream).await?;
-            log::info!("[Client] TLS handshake completed");
+            log::debug!("[Client] TLS handshake completed");
 
             send_authentication(&mut tls_stream, password_sha256, padding.clone()).await?;
-            log::info!("[Client] Authentication completed");
+            log::debug!("[Client] Authentication completed");
 
             Ok(Box::new(tls_stream) as Box<dyn AsyncReadWrite>)
         }))
@@ -77,7 +77,7 @@ async fn send_authentication(
 
     tls_stream.write_all(&auth_request).await?;
     tls_stream.flush().await?;
-    log::info!("[Client] Authentication request sent (padding: {} bytes)", padding_length);
+    log::debug!("[Client] Authentication request sent (padding: {} bytes)", padding_length);
     Ok(())
 }
 

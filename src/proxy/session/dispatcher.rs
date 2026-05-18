@@ -35,7 +35,7 @@ impl Session {
             return Ok(());
         }
         let stream_tx = {
-            let streams = self.streams.read().await;
+            let streams = self.state.streams.read().await;
             streams.get(&sid).cloned()
         };
 
@@ -61,7 +61,7 @@ impl Session {
             return Ok(());
         }
 
-        if self.streams.read().await.contains_key(&sid) {
+        if self.state.streams.read().await.contains_key(&sid) {
             let err = format!("Stream {} already exists", sid);
             let _ = self
                 .write_control_frame(Frame::with_data(CMD_SYNACK, sid, Bytes::from(err)))
@@ -73,18 +73,18 @@ impl Session {
         let (close_tx, _close_rx) = oneshot::channel();
         let stream = Stream::new(sid, data_rx, self.frame_tx.clone(), close_tx);
         {
-            let mut streams = self.streams.write().await;
+            let mut streams = self.state.streams.write().await;
             streams.insert(sid, data_tx);
         }
-        self.stream_count.fetch_add(1, Ordering::AcqRel);
+        self.state.stream_count.fetch_add(1, Ordering::AcqRel);
 
         if let Err(e) = self.write_control_frame(Frame::new(CMD_SYNACK, sid)).await {
             log::error!("Failed to send SYNACK for stream {}: {}", sid, e);
-            let mut streams = self.streams.write().await;
+            let mut streams = self.state.streams.write().await;
             streams.remove(&sid);
             return Ok(());
         }
-        log::info!("Stream {} opened successfully", sid);
+        log::debug!("Stream {} opened successfully", sid);
         if let Some(cb) = &self.on_new_stream {
             cb(stream);
         }
@@ -96,7 +96,7 @@ impl Session {
             log::warn!("Server received unexpected SYNACK for stream: {}", sid);
             return Ok(());
         }
-        if self.streams.read().await.get(&sid).is_some() && !data.is_empty() {
+        if self.state.streams.read().await.get(&sid).is_some() && !data.is_empty() {
             let error_msg = String::from_utf8_lossy(&data);
             log::warn!("Stream {} open failed: {}", sid, error_msg);
         }
@@ -104,9 +104,9 @@ impl Session {
     }
 
     async fn handle_fin(&self, sid: u32) -> io::Result<()> {
-        let mut streams = self.streams.write().await;
+        let mut streams = self.state.streams.write().await;
         if streams.remove(&sid).is_some() {
-            self.stream_count.fetch_sub(1, Ordering::AcqRel);
+            self.state.stream_count.fetch_sub(1, Ordering::AcqRel);
         }
         Ok(())
     }
@@ -138,7 +138,7 @@ impl Session {
             let settings = StringMap::from_bytes(&data);
             if let Some(version) = settings.get("v") {
                 if let Ok(v) = version.parse::<u32>() {
-                    self.peer_version.store(v, Ordering::Release);
+                    self.state.peer_version.store(v, Ordering::Release);
                 }
             }
         }
@@ -156,7 +156,7 @@ impl Session {
         }
         if let Some(version) = settings.get("v") {
             if let Ok(v) = version.parse::<u32>() {
-                self.peer_version.store(v, Ordering::Release);
+                self.state.peer_version.store(v, Ordering::Release);
                 if v >= 2 {
                     let server_settings = StringMap::from([("v".to_string(), "2".to_string())]);
                     let frame = Frame::with_data(

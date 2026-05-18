@@ -18,6 +18,20 @@ AnyTLS works by:
 3. Implementing connection reuse to reduce latency
 4. Supporting both TCP and UDP (via UDP over TCP) proxying
 
+## UDP-over-TCP support status
+
+- `anytls-rs` supports UDP over AnyTLS using sing UoT v2 semantics in its built-in client/server binaries:
+  - `anytls-client` accepts SOCKS5 `CMD=3 (UDP ASSOCIATE)`.
+  - `anytls-server` recognizes `sp.v2.udp-over-tcp.arpa` and processes UoT frames.
+  - UoT v2 request and datagram framing are aligned with `anytls-go` / `sing` behavior.
+- Interop verification has been completed for both directions:
+  - `anytls-rs client` <-> `anytls-go server`
+  - `anytls-go client` <-> `anytls-rs server`
+  - TCP and UDP proxy paths are both functional in the demo environment.
+- Scope note:
+  - `anytls-rs` remains a protocol-core demo project.
+  - Engineering features (policy routing, production observability, large-scale tuning) should stay in `anybls`.
+
 ## Installation
 
 ### Building from Source

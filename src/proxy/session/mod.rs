@@ -1,8 +1,10 @@
 pub mod client;
+mod close_reason;
 mod core;
 mod dispatcher;
 pub mod frame;
 mod io_loop;
+mod state;
 pub mod stream;
 
 pub use client::Client;
