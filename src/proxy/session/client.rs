@@ -176,6 +176,20 @@ impl Client {
         Ok(stream)
     }
 
+    pub async fn heartbeat_probe(&self, timeout: Duration) -> io::Result<Duration> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Client closed"));
+        }
+        let session = if let Some(session) = self.get_idle_session().await {
+            session
+        } else {
+            self.create_session().await?
+        };
+        let rtt = session.heartbeat_probe(timeout).await?;
+        self.return_to_idle(session).await;
+        Ok(rtt)
+    }
+
     async fn get_idle_session(&self) -> Option<Arc<Session>> {
         let mut to_close = Vec::new();
         let mut selected = None;

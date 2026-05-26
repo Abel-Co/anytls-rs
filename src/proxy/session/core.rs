@@ -1,6 +1,8 @@
 use crate::proxy::padding::PaddingFactory;
 use crate::proxy::session::close_reason::is_expected_close_error;
-use crate::proxy::session::frame::{Frame, CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, HEADER_OVERHEAD_SIZE};
+use crate::proxy::session::frame::{
+    Frame, CMD_FIN, CMD_HEART_REQUEST, CMD_PSH, CMD_SETTINGS, CMD_SYN, HEADER_OVERHEAD_SIZE,
+};
 use crate::proxy::session::state::SessionState;
 use crate::proxy::session::stream::Stream;
 use crate::util::r#type::AsyncReadWrite;
@@ -11,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::time::Duration;
 
 /// Session 管理多个 Stream 的连接复用
 pub struct Session {
@@ -212,5 +215,38 @@ impl Session {
 
     pub(super) fn touch_activity(&self) {
         self.state.touch_activity();
+    }
+
+    pub async fn heartbeat_probe(&self, timeout: Duration) -> io::Result<Duration> {
+        if self.is_closed() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed"));
+        }
+        let sid = self.state.next_stream_id.fetch_add(1, Ordering::AcqRel);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut waiters = self.state.heartbeat_waiters.write().await;
+            waiters.insert(sid, tx);
+        }
+
+        let start = std::time::Instant::now();
+        if let Err(e) = self.write_control_frame(Frame::new(CMD_HEART_REQUEST, sid)).await {
+            let mut waiters = self.state.heartbeat_waiters.write().await;
+            let _ = waiters.remove(&sid);
+            return Err(e);
+        }
+
+        let waited = tokio::time::timeout(timeout, rx).await;
+        match waited {
+            Ok(Ok(())) => Ok(start.elapsed()),
+            Ok(Err(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "heartbeat probe channel closed",
+            )),
+            Err(_) => {
+                let mut waiters = self.state.heartbeat_waiters.write().await;
+                let _ = waiters.remove(&sid);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "heartbeat probe timeout"))
+            }
+        }
     }
 }

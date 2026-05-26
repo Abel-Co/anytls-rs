@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 pub(super) struct SessionState {
     pub(super) streams: Arc<RwLock<HashMap<u32, mpsc::Sender<Bytes>>>>,
+    pub(super) heartbeat_waiters: Arc<RwLock<HashMap<u32, oneshot::Sender<()>>>>,
     pub(super) next_stream_id: AtomicU32,
     pub(super) peer_version: AtomicU32,
     pub(super) closed: AtomicBool,
@@ -18,6 +19,7 @@ impl SessionState {
     pub(super) fn new() -> Self {
         Self {
             streams: Arc::new(RwLock::new(HashMap::new())),
+            heartbeat_waiters: Arc::new(RwLock::new(HashMap::new())),
             next_stream_id: AtomicU32::new(1),
             peer_version: AtomicU32::new(0),
             closed: AtomicBool::new(false),
