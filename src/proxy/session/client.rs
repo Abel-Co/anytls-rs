@@ -231,17 +231,20 @@ impl Client {
 
         let mut idle_sessions = self.idle_sessions.lock().await;
         idle_sessions.insert_or_refresh(session, now_unix_ms());
+        let idle_pool_size = idle_sessions.len();
 
         if idle_sessions.len() > self.min_idle_sessions * 2 {
             let to_close = idle_sessions.truncate_to(self.min_idle_sessions);
+            let idle_pool_size = idle_sessions.len();
             drop(idle_sessions);
             for session in to_close {
                 let _ = session.close().await;
             }
+            log::debug!("Session returned to idle pool, idle_pool_size={} (trimmed)", idle_pool_size);
             return;
         }
 
-        log::debug!("Session returned to idle pool");
+        log::debug!("Session returned to idle pool, idle_pool_size={}", idle_pool_size);
     }
 
     async fn ensure_min_idle_sessions(&self) {
@@ -257,6 +260,11 @@ impl Client {
         if need == 0 {
             return;
         }
+        log::debug!(
+            "Prewarming idle sessions, idle_pool_size={}, need={}",
+            self.min_idle_sessions - need,
+            need
+        );
 
         for _ in 0..need {
             if self.closed.load(Ordering::Acquire) {
