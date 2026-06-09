@@ -32,7 +32,13 @@ impl IdlePool {
     fn insert_or_refresh(&mut self, session: Arc<Session>, idle_since_ms: u64) {
         let key = session_key(&session);
         let _ = self.entries.remove(&key);
-        self.entries.insert(key, IdleEntry { session, idle_since_ms });
+        self.entries.insert(
+            key,
+            IdleEntry {
+                session,
+                idle_since_ms,
+            },
+        );
     }
 
     fn pop_back(&mut self) -> Option<IdleEntry> {
@@ -41,18 +47,6 @@ impl IdlePool {
 
     fn pop_front(&mut self) -> Option<IdleEntry> {
         self.entries.pop_front().map(|(_, entry)| entry)
-    }
-
-    fn truncate_to(&mut self, keep: usize) -> Vec<Arc<Session>> {
-        let mut removed = Vec::new();
-        while self.len() > keep {
-            if let Some(entry) = self.pop_front() {
-                removed.push(entry.session);
-            } else {
-                break;
-            }
-        }
-        removed
     }
 }
 
@@ -137,7 +131,10 @@ impl Client {
         let (session, mut stream) = match self.open_stream_from_available_session().await {
             Ok(v) => v,
             Err(first_err) => {
-                log::debug!("Idle session open failed, creating replacement: {}", first_err);
+                log::debug!(
+                    "Idle session open failed, creating replacement: {}",
+                    first_err
+                );
                 let session = self.create_session().await?;
                 log::debug!("Created new session");
                 let stream = session.open_stream().await?;
@@ -188,30 +185,13 @@ impl Client {
     }
 
     async fn get_idle_session(&self) -> Option<Arc<Session>> {
-        let mut to_close = Vec::new();
-        let mut selected = None;
-        {
-            let mut idle_sessions = self.idle_sessions.lock().await;
-            let now = now_unix_ms();
-            let timeout_ms = self.idle_timeout.as_millis() as u64;
-
-            while let Some(entry) = idle_sessions.pop_back() {
-                if entry.session.is_closed() {
-                    continue;
-                }
-                if timeout_ms > 0 && now.saturating_sub(entry.idle_since_ms) > timeout_ms {
-                    to_close.push(entry.session);
-                    continue;
-                }
-                selected = Some(entry.session);
-                break;
+        let mut idle_sessions = self.idle_sessions.lock().await;
+        while let Some(entry) = idle_sessions.pop_back() {
+            if !entry.session.is_closed() {
+                return Some(entry.session);
             }
         }
-
-        for session in to_close {
-            let _ = session.close().await;
-        }
-        selected
+        None
     }
 
     async fn create_session(&self) -> io::Result<Arc<Session>> {
@@ -232,19 +212,10 @@ impl Client {
         let mut idle_sessions = self.idle_sessions.lock().await;
         idle_sessions.insert_or_refresh(session, now_unix_ms());
         let idle_pool_size = idle_sessions.len();
-
-        if idle_sessions.len() > self.min_idle_sessions * 2 {
-            let to_close = idle_sessions.truncate_to(self.min_idle_sessions);
-            let idle_pool_size = idle_sessions.len();
-            drop(idle_sessions);
-            for session in to_close {
-                let _ = session.close().await;
-            }
-            log::debug!("Session returned to idle pool, idle_pool_size={} (trimmed)", idle_pool_size);
-            return;
-        }
-
-        log::debug!("Session returned to idle pool, idle_pool_size={}", idle_pool_size);
+        log::debug!(
+            "Session returned to idle pool, idle_pool_size={}",
+            idle_pool_size
+        );
     }
 
     async fn ensure_min_idle_sessions(&self) {
@@ -294,26 +265,21 @@ impl Client {
                 if entry.session.is_closed() {
                     continue;
                 }
-                let expired = timeout_ms > 0 && now.saturating_sub(entry.idle_since_ms) > timeout_ms;
+                let expired =
+                    timeout_ms > 0 && now.saturating_sub(entry.idle_since_ms) > timeout_ms;
                 if expired && kept >= keep_min {
                     to_close.push(entry.session);
                     continue;
                 }
                 kept += 1;
-                survivors.push(entry);
+                survivors.push(IdleEntry {
+                    idle_since_ms: if expired { now } else { entry.idle_since_ms },
+                    session: entry.session,
+                });
             }
 
             for entry in survivors {
                 idle_sessions.insert_or_refresh(entry.session, entry.idle_since_ms);
-            }
-
-            if idle_sessions.len() > keep_min {
-                let excess = idle_sessions.len() - keep_min;
-                for _ in 0..excess {
-                    if let Some(entry) = idle_sessions.pop_front() {
-                        to_close.push(entry.session);
-                    }
-                }
             }
         }
 
