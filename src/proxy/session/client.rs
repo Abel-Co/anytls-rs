@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 struct IdleEntry {
@@ -56,14 +56,8 @@ impl IdlePool {
     }
 }
 
-struct ReturnEvent {
-    client: Client,
-    session: Arc<Session>,
-}
-
 struct GlobalControl {
     clients: Arc<StdMutex<HashMap<usize, Client>>>,
-    return_tx: mpsc::Sender<ReturnEvent>,
 }
 
 static GLOBAL_CONTROL: OnceLock<GlobalControl> = OnceLock::new();
@@ -72,43 +66,29 @@ static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 fn global_control() -> &'static GlobalControl {
     GLOBAL_CONTROL.get_or_init(|| {
         let clients = Arc::new(StdMutex::new(HashMap::<usize, Client>::new()));
-        let (return_tx, mut return_rx) = mpsc::channel::<ReturnEvent>(4096);
         let cleanup_clients = Arc::clone(&clients);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
-                tokio::select! {
-                    maybe_ev = return_rx.recv() => {
-                        let Some(ev) = maybe_ev else {
-                            break;
-                        };
-                        if ev.client.closed.load(Ordering::Acquire) {
-                            continue;
-                        }
-                        ev.client.return_to_idle(ev.session).await;
-                    }
-                    _ = interval.tick() => {
-                        let snapshot = {
-                            let clients = cleanup_clients
-                                .lock()
-                                .expect("global anytls-rs clients lock poisoned");
-                            clients.values().cloned().collect::<Vec<_>>()
-                        };
+                interval.tick().await;
+                let snapshot = {
+                    let clients = cleanup_clients
+                        .lock()
+                        .expect("global anytls-rs clients lock poisoned");
+                    clients.values().cloned().collect::<Vec<_>>()
+                };
 
-                        for client in snapshot {
-                            if client.closed.load(Ordering::Acquire) {
-                                continue;
-                            }
-                            client.ensure_min_idle_sessions().await;
-                            client.cleanup_idle_sessions().await;
-                        }
+                for client in snapshot {
+                    if client.closed.load(Ordering::Acquire) {
+                        continue;
                     }
+                    client.ensure_min_idle_sessions().await;
+                    client.cleanup_idle_sessions().await;
                 }
-
             }
         });
 
-        GlobalControl { clients, return_tx }
+        GlobalControl { clients }
     })
 }
 
@@ -154,6 +134,27 @@ impl Client {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Client closed"));
         }
 
+        let (session, mut stream) = match self.open_stream_from_available_session().await {
+            Ok(v) => v,
+            Err(first_err) => {
+                log::debug!("Idle session open failed, creating replacement: {}", first_err);
+                let session = self.create_session().await?;
+                log::debug!("Created new session");
+                let stream = session.open_stream().await?;
+                (session, stream)
+            }
+        };
+        let this = self.clone();
+        let session_for_hook = Arc::clone(&session);
+        stream.set_on_close(Box::new(move || {
+            tokio::spawn(async move {
+                this.return_to_idle(session_for_hook).await;
+            });
+        }));
+        Ok(stream)
+    }
+
+    async fn open_stream_from_available_session(&self) -> io::Result<(Arc<Session>, Stream)> {
         let session = if let Some(session) = self.get_idle_session().await {
             log::debug!("Reusing idle session");
             session
@@ -163,17 +164,13 @@ impl Client {
             session
         };
 
-        let mut stream = session.open_stream().await?;
-        let this = self.clone();
-        let session_for_hook = Arc::clone(&session);
-        stream.set_on_close(Box::new(move || {
-            let tx = &global_control().return_tx;
-            let _ = tx.try_send(ReturnEvent {
-                client: this.clone(),
-                session: Arc::clone(&session_for_hook),
-            });
-        }));
-        Ok(stream)
+        match session.open_stream().await {
+            Ok(stream) => Ok((session, stream)),
+            Err(e) => {
+                let _ = session.close().await;
+                Err(e)
+            }
+        }
     }
 
     pub async fn heartbeat_probe(&self, timeout: Duration) -> io::Result<Duration> {
@@ -226,6 +223,9 @@ impl Client {
 
     async fn return_to_idle(&self, session: Arc<Session>) {
         if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if session.is_closed() {
             return;
         }
 

@@ -8,9 +8,10 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 pub(super) struct SessionState {
     pub(super) streams: Arc<RwLock<HashMap<u32, mpsc::Sender<Bytes>>>>,
     pub(super) heartbeat_waiters: Arc<RwLock<HashMap<u32, oneshot::Sender<()>>>>,
+    pub(super) synack_waiters: Arc<RwLock<HashMap<u32, oneshot::Sender<()>>>>,
     pub(super) next_stream_id: AtomicU32,
     pub(super) peer_version: AtomicU32,
-    pub(super) closed: AtomicBool,
+    pub(super) closed: Arc<AtomicBool>,
     pub(super) stream_count: AtomicU32,
     pub(super) last_active_unix_ms: AtomicU64,
 }
@@ -20,9 +21,10 @@ impl SessionState {
         Self {
             streams: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_waiters: Arc::new(RwLock::new(HashMap::new())),
+            synack_waiters: Arc::new(RwLock::new(HashMap::new())),
             next_stream_id: AtomicU32::new(1),
             peer_version: AtomicU32::new(0),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             stream_count: AtomicU32::new(0),
             last_active_unix_ms: AtomicU64::new(now_unix_ms()),
         }

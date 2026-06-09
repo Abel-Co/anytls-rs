@@ -15,6 +15,8 @@ use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::Duration;
 
+const SYNACK_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Session 管理多个 Stream 的连接复用
 pub struct Session {
     pub(super) state: SessionState,
@@ -26,7 +28,7 @@ pub struct Session {
     pub(super) send_padding: AtomicBool,
     pub(super) frame_tx: mpsc::Sender<Frame>,
     pub(super) frame_rx: Mutex<Option<mpsc::Receiver<Frame>>>,
-    pub(super) close_notify: Notify,
+    pub(super) close_notify: Arc<Notify>,
     pub(super) on_new_stream: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
     pub(super) on_close: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -45,7 +47,7 @@ impl Session {
             send_padding: AtomicBool::new(true),
             frame_tx,
             frame_rx: Mutex::new(Some(frame_rx)),
-            close_notify: Notify::new(),
+            close_notify: Arc::new(Notify::new()),
             on_new_stream: None,
             on_close: None,
         }
@@ -69,7 +71,7 @@ impl Session {
             send_padding: AtomicBool::new(false),
             frame_tx,
             frame_rx: Mutex::new(Some(frame_rx)),
-            close_notify: Notify::new(),
+            close_notify: Arc::new(Notify::new()),
             on_new_stream,
             on_close,
         }
@@ -106,7 +108,7 @@ impl Session {
         Ok(())
     }
 
-    pub async fn open_stream(&self) -> io::Result<Stream> {
+    pub async fn open_stream(self: &Arc<Self>) -> io::Result<Stream> {
         if self.is_closed() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session closed"));
         }
@@ -122,6 +124,35 @@ impl Session {
             streams.insert(stream_id, data_tx);
         }
         self.state.stream_count.fetch_add(1, Ordering::AcqRel);
+
+        if self.is_client
+            && stream_id >= 2
+            && self.state.peer_version.load(Ordering::Acquire) >= 2
+        {
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut waiters = self.state.synack_waiters.write().await;
+                waiters.insert(stream_id, tx);
+            }
+            let waiters = Arc::clone(&self.state.synack_waiters);
+            let close_notify = Arc::clone(&self.close_notify);
+            let session = Arc::clone(self);
+            tokio::spawn(async move {
+                tokio::select! {
+                    waited = tokio::time::timeout(SYNACK_TIMEOUT, rx) => {
+                        if matches!(waited, Err(_) | Ok(Err(_))) {
+                            {
+                                let mut waiters = waiters.write().await;
+                                let _ = waiters.remove(&stream_id);
+                            }
+                            let _ = session.close().await;
+                        }
+                    }
+                    _ = close_notify.notified() => {}
+                }
+            });
+        }
+
         self.write_control_frame(Frame::new(CMD_SYN, stream_id)).await?;
         log::debug!("[Session] SYN frame sent for stream {}", stream_id);
         Ok(stream)
@@ -205,6 +236,10 @@ impl Session {
         {
             let mut streams = self.state.streams.write().await;
             streams.clear();
+        }
+        {
+            let mut waiters = self.state.synack_waiters.write().await;
+            waiters.clear();
         }
         self.state.stream_count.store(0, Ordering::Release);
         if let Some(cb) = &self.on_close {
