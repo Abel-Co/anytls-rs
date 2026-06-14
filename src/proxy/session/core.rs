@@ -140,12 +140,21 @@ impl Session {
             tokio::spawn(async move {
                 tokio::select! {
                     waited = tokio::time::timeout(SYNACK_TIMEOUT, rx) => {
-                        if matches!(waited, Err(_) | Ok(Err(_))) {
-                            {
-                                let mut waiters = waiters.write().await;
-                                let _ = waiters.remove(&stream_id);
+                        match waited {
+                            Ok(Ok(Ok(()))) => {}
+                            Ok(Ok(Err(err))) => {
+                                log::debug!("SYNACK reported stream {} failure: {}", stream_id, err);
+                                session.remove_stream(stream_id).await;
+                                let _ = session.close().await;
                             }
-                            let _ = session.close().await;
+                            Ok(Err(_)) | Err(_) => {
+                                {
+                                    let mut waiters = waiters.write().await;
+                                    let _ = waiters.remove(&stream_id);
+                                }
+                                session.remove_stream(stream_id).await;
+                                let _ = session.close().await;
+                            }
                         }
                     }
                     _ = close_notify.notified() => {}
@@ -159,14 +168,19 @@ impl Session {
     }
 
     pub async fn close_stream(&self, stream_id: u32) -> io::Result<()> {
-        {
-            let mut streams = self.state.streams.write().await;
-            if streams.remove(&stream_id).is_some() {
-                self.state.stream_count.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
+        self.remove_stream(stream_id).await;
         self.write_control_frame(Frame::new(CMD_FIN, stream_id)).await?;
         Ok(())
+    }
+
+    pub(super) async fn remove_stream(&self, stream_id: u32) -> bool {
+        let mut streams = self.state.streams.write().await;
+        if streams.remove(&stream_id).is_some() {
+            self.state.stream_count.fetch_sub(1, Ordering::AcqRel);
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn write_data_frame(&self, stream_id: u32, data: &[u8]) -> io::Result<usize> {
