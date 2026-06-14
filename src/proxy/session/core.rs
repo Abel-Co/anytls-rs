@@ -145,7 +145,6 @@ impl Session {
                             Ok(Ok(Err(err))) => {
                                 log::debug!("SYNACK reported stream {} failure: {}", stream_id, err);
                                 session.remove_stream(stream_id).await;
-                                let _ = session.close().await;
                             }
                             Ok(Err(_)) | Err(_) => {
                                 {
