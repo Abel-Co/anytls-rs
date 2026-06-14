@@ -97,22 +97,24 @@ impl Session {
             return Ok(());
         }
 
-        {
+        let waiter = {
             let mut waiters = self.state.synack_waiters.write().await;
-            if let Some(tx) = waiters.remove(&sid) {
-                let _ = tx.send(());
-            }
-        }
+            waiters.remove(&sid)
+        };
 
         if !data.is_empty() {
-            let removed = {
-                let mut streams = self.state.streams.write().await;
-                streams.remove(&sid).is_some()
-            };
-            if removed {
-                self.state.stream_count.fetch_sub(1, Ordering::AcqRel);
+            let msg = String::from_utf8_lossy(&data).to_string();
+            if let Some(tx) = waiter {
+                let _ = tx.send(Err(io::Error::other(format!("remote: {}", msg))));
+            } else {
+                self.remove_stream(sid).await;
             }
-            log::warn!("Stream {} open failed: {}", sid, String::from_utf8_lossy(&data));
+            log::warn!("Stream {} open failed: {}", sid, msg);
+            return Ok(());
+        }
+
+        if let Some(tx) = waiter {
+            let _ = tx.send(Ok(()));
         }
         Ok(())
     }

@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::{collections::HashMap, io};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 pub(super) struct SessionState {
     pub(super) streams: Arc<RwLock<HashMap<u32, mpsc::Sender<Bytes>>>>,
     pub(super) heartbeat_waiters: Arc<RwLock<HashMap<u32, oneshot::Sender<()>>>>,
-    pub(super) synack_waiters: Arc<RwLock<HashMap<u32, oneshot::Sender<()>>>>,
+    pub(super) synack_waiters: Arc<RwLock<HashMap<u32, oneshot::Sender<io::Result<()>>>>>,
     pub(super) next_stream_id: AtomicU32,
     pub(super) peer_version: AtomicU32,
     pub(super) closed: Arc<AtomicBool>,
