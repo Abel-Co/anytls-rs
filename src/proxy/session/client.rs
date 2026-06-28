@@ -350,9 +350,13 @@ impl Client {
             }
         }
 
+        let closed_count = to_close.len();
         for session in to_close {
             self.remove_active_session(&session).await;
             let _ = session.close().await;
+        }
+        if closed_count > 0 {
+            log::debug!("Idle cleanup closed {} sessions", closed_count);
         }
     }
 
