@@ -139,9 +139,7 @@ impl Session {
             return Ok(());
         }
         let alert_msg = String::from_utf8_lossy(&data);
-        Err(io::Error::other(
-            format!("Alert received: {}", alert_msg),
-        ))
+        Err(io::Error::other(format!("Alert received: {}", alert_msg)))
     }
 
     async fn handle_heartbeat_request(&self, sid: u32) -> io::Result<()> {

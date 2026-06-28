@@ -3,6 +3,7 @@ use crate::proxy::session::close_reason::is_expected_close_error;
 use crate::proxy::session::frame::{
     Frame, CMD_FIN, CMD_HEART_REQUEST, CMD_PSH, CMD_SETTINGS, CMD_SYN, HEADER_OVERHEAD_SIZE,
 };
+use crate::proxy::session::io_loop::write_frame_to;
 use crate::proxy::session::state::SessionState;
 use crate::proxy::session::stream::Stream;
 use crate::util::r#type::AsyncReadWrite;
@@ -125,9 +126,7 @@ impl Session {
         }
         self.state.stream_count.fetch_add(1, Ordering::AcqRel);
 
-        if self.is_client
-            && stream_id >= 2
-            && self.state.peer_version.load(Ordering::Acquire) >= 2
+        if self.is_client && stream_id >= 2 && self.state.peer_version.load(Ordering::Acquire) >= 2
         {
             let (tx, rx) = oneshot::channel();
             {
@@ -172,6 +171,10 @@ impl Session {
         Ok(())
     }
 
+    pub async fn finish_stream(&self, stream_id: u32) {
+        self.remove_stream(stream_id).await;
+    }
+
     pub(super) async fn remove_stream(&self, stream_id: u32) -> bool {
         let mut streams = self.state.streams.write().await;
         if streams.remove(&stream_id).is_some() {
@@ -209,12 +212,11 @@ impl Session {
             ("padding-md5".to_string(), self.padding.md5().to_string()),
         ]);
         let frame = Frame::with_data(CMD_SETTINGS, 0, Bytes::from(settings.to_bytes()));
-        let data = frame.to_bytes();
         let mut conn_guard = self.conn_w.lock().await;
         let conn = conn_guard.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed")
         })?;
-        conn.write_all(&data).await?;
+        write_frame_to(conn, frame).await?;
         Ok(())
     }
 

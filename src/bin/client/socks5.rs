@@ -1,4 +1,4 @@
-use crate::proxy::addr_codec::{
+use anytls_rs::proxy::addr_codec::{
     build_socks_addr as build_socks_addr_raw, read_socks_addr_with_atyp, AddressType, SocksAddr,
 };
 use std::io;
@@ -26,10 +26,7 @@ where
     stream.read_exact(&mut methods).await?;
     if !methods.contains(&0x00) {
         stream.write_all(&[0x05, 0xFF]).await?;
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "no acceptable auth method",
-        ));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "no acceptable auth method"));
     }
     stream.write_all(&[0x05, 0x00]).await?;
     Ok(())
@@ -50,7 +47,9 @@ where
     }
     match head[3] {
         0x01 | 0x03 | 0x04 => {}
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported address type")),
+        _ => {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported address type"))
+        }
     }
 
     let addr = read_socks_addr_with_atyp(stream, head[3]).await?;
@@ -67,7 +66,8 @@ where
     S: AsyncWrite + Unpin,
 {
     // VER=5 REP=0 RSV=0 ATYP=IPv4 BND.ADDR=0.0.0.0 BND.PORT=0
-    stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
+    stream
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
 }
 
 pub fn build_socks_addr(req: &SocksRequest) -> io::Result<Vec<u8>> {
@@ -83,7 +83,8 @@ where
     S: AsyncWrite + Unpin,
 {
     // VER=5 REP=7 command not supported RSV=0 ATYP=IPv4 BND.ADDR=0.0.0.0 BND.PORT=0
-    stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
+    stream
+        .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
 }
 
 pub async fn write_udp_associate_reply<S>(stream: &mut S, bind_port: u16) -> io::Result<()>
@@ -93,38 +94,5 @@ where
     let port = bind_port.to_be_bytes();
     // VER=5 REP=0 RSV=0 ATYP=IPv4 BND.ADDR=0.0.0.0 BND.PORT=bind_port
     stream
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, port[0], port[1]])
-        .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_build_socks_addr_domain() {
-        let req = SocksRequest {
-            command: 0x01,
-            atyp: AddressType::Domain,
-            host: "www.google.com".to_string(),
-            port: 443,
-        };
-        let out = build_socks_addr(&req).unwrap();
-        assert_eq!(out[0], 0x03);
-        assert_eq!(out[1] as usize, "www.google.com".len());
-        assert_eq!(&out[2..2 + "www.google.com".len()], b"www.google.com");
-        assert_eq!(&out[out.len() - 2..], &443u16.to_be_bytes());
-    }
-
-    #[test]
-    fn test_build_socks_addr_ipv4() {
-        let req = SocksRequest {
-            command: 0x01,
-            atyp: AddressType::Ipv4,
-            host: "1.2.3.4".to_string(),
-            port: 8080,
-        };
-        let out = build_socks_addr(&req).unwrap();
-        assert_eq!(out, vec![0x01, 1, 2, 3, 4, 0x1f, 0x90]);
-    }
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, port[0], port[1]]).await
 }

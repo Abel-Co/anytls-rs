@@ -1,18 +1,18 @@
-use crate::proxy::session::Client;
-use crate::proxy::socks5;
-use crate::proxy::uot;
+use crate::socks5;
+use anytls_rs::proxy::session::Client;
+use anytls_rs::proxy::uot;
 use log::{error, info};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::copy_bidirectional;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::UdpSocket;
 
 const UOT_DEST_HOST: &str = uot::MAGIC_ADDRESS;
 const UOT_DEST_PORT: u16 = 443;
 
 fn parse_socks5_udp_packet(
     pkt: &[u8],
-) -> Result<(crate::proxy::addr_codec::SocksAddr, usize), Box<dyn std::error::Error>> {
+) -> Result<(anytls_rs::proxy::addr_codec::SocksAddr, usize), Box<dyn std::error::Error>> {
     if pkt.len() < 4 {
         return Err("short udp packet".into());
     }
@@ -30,8 +30,8 @@ fn parse_socks5_udp_packet(
             idx += 4;
             let port = u16::from_be_bytes([pkt[idx], pkt[idx + 1]]);
             idx += 2;
-            crate::proxy::addr_codec::SocksAddr {
-                atyp: crate::proxy::addr_codec::AddressType::Ipv4,
+            anytls_rs::proxy::addr_codec::SocksAddr {
+                atyp: anytls_rs::proxy::addr_codec::AddressType::Ipv4,
                 host: ip.to_string(),
                 port,
             }
@@ -45,8 +45,8 @@ fn parse_socks5_udp_packet(
             idx += 16;
             let port = u16::from_be_bytes([pkt[idx], pkt[idx + 1]]);
             idx += 2;
-            crate::proxy::addr_codec::SocksAddr {
-                atyp: crate::proxy::addr_codec::AddressType::Ipv6,
+            anytls_rs::proxy::addr_codec::SocksAddr {
+                atyp: anytls_rs::proxy::addr_codec::AddressType::Ipv6,
                 host: std::net::Ipv6Addr::from(ipb).to_string(),
                 port,
             }
@@ -64,8 +64,8 @@ fn parse_socks5_udp_packet(
             idx += len;
             let port = u16::from_be_bytes([pkt[idx], pkt[idx + 1]]);
             idx += 2;
-            crate::proxy::addr_codec::SocksAddr {
-                atyp: crate::proxy::addr_codec::AddressType::Domain,
+            anytls_rs::proxy::addr_codec::SocksAddr {
+                atyp: anytls_rs::proxy::addr_codec::AddressType::Domain,
                 host,
                 port,
             }
@@ -78,11 +78,14 @@ fn parse_socks5_udp_packet(
     Ok((addr, idx))
 }
 
-fn build_socks5_udp_packet(addr: &crate::proxy::addr_codec::SocksAddr, payload: &[u8]) -> Vec<u8> {
+fn build_socks5_udp_packet(
+    addr: &anytls_rs::proxy::addr_codec::SocksAddr,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + payload.len());
     out.extend_from_slice(&[0, 0, 0]); // RSV RSV FRAG
     match addr.atyp {
-        crate::proxy::addr_codec::AddressType::Ipv4 => {
+        anytls_rs::proxy::addr_codec::AddressType::Ipv4 => {
             out.push(0x01);
             if let Ok(ip) = addr.host.parse::<std::net::Ipv4Addr>() {
                 out.extend_from_slice(&ip.octets());
@@ -90,7 +93,7 @@ fn build_socks5_udp_packet(addr: &crate::proxy::addr_codec::SocksAddr, payload: 
                 out.extend_from_slice(&[0, 0, 0, 0]);
             }
         }
-        crate::proxy::addr_codec::AddressType::Ipv6 => {
+        anytls_rs::proxy::addr_codec::AddressType::Ipv6 => {
             out.push(0x04);
             if let Ok(ip) = addr.host.parse::<std::net::Ipv6Addr>() {
                 out.extend_from_slice(&ip.octets());
@@ -98,7 +101,7 @@ fn build_socks5_udp_packet(addr: &crate::proxy::addr_codec::SocksAddr, payload: 
                 out.extend_from_slice(&[0u8; 16]);
             }
         }
-        crate::proxy::addr_codec::AddressType::Domain => {
+        anytls_rs::proxy::addr_codec::AddressType::Domain => {
             out.push(0x03);
             let b = addr.host.as_bytes();
             let l = b.len().min(255);
@@ -118,12 +121,15 @@ async fn handle_udp_associate(
     let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
     let bind_port = udp_socket.local_addr()?.port();
     socks5::write_udp_associate_reply(&mut client_conn, bind_port).await?;
-    info!("[Client] UDP associate established on 0.0.0.0:{}", bind_port);
+    info!(
+        "[Client] UDP associate established on 0.0.0.0:{}",
+        bind_port
+    );
 
     let mut stream = client.create_stream().await?;
     let uot_req = socks5::SocksRequest {
         command: 0x01,
-        atyp: crate::proxy::addr_codec::AddressType::Domain,
+        atyp: anytls_rs::proxy::addr_codec::AddressType::Domain,
         host: UOT_DEST_HOST.to_string(),
         port: UOT_DEST_PORT,
     };
@@ -132,8 +138,8 @@ async fn handle_udp_associate(
     stream.flush().await?;
     let uot_request = uot::Request {
         is_connect: false,
-        destination: crate::proxy::addr_codec::SocksAddr {
-            atyp: crate::proxy::addr_codec::AddressType::Ipv4,
+        destination: anytls_rs::proxy::addr_codec::SocksAddr {
+            atyp: anytls_rs::proxy::addr_codec::AddressType::Ipv4,
             host: "0.0.0.0".to_string(),
             port: 0,
         },
