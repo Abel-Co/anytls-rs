@@ -1,7 +1,7 @@
-use super::core::Session;
 use super::close_reason::is_expected_close_error;
+use super::core::Session;
 use crate::proxy::session::frame::{Frame, RawHeader, CMD_WASTE, HEADER_OVERHEAD_SIZE};
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -33,37 +33,35 @@ impl Session {
     }
 
     async fn write_frame(&self, frame: Frame) -> io::Result<usize> {
-        self.write_conn(&frame.to_bytes()).await
-    }
-
-    async fn write_conn(&self, data: &[u8]) -> io::Result<usize> {
+        let frame_len = frame_len(&frame);
         let mut conn_guard = self.conn_w.lock().await;
         let conn = conn_guard.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "session write half closed")
         })?;
 
         if self.send_padding.load(Ordering::Acquire) {
-            self.write_with_padding(conn, data).await
+            self.write_with_padding(conn, frame).await?;
         } else {
-            conn.write_all(data).await?;
-            Ok(data.len())
+            write_frame_to(conn, frame).await?;
         }
+        Ok(frame_len)
     }
 
-    async fn write_with_padding<W>(&self, conn: &mut W, data: &[u8]) -> io::Result<usize>
+    async fn write_with_padding<W>(&self, conn: &mut W, frame: Frame) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,
     {
         let pkt = self.pkt_counter.fetch_add(1, Ordering::AcqRel);
+        let data_len = frame_len(&frame);
         if pkt >= self.padding.stop() {
             self.send_padding.store(false, Ordering::Release);
-            conn.write_all(data).await?;
-            return Ok(data.len());
+            write_frame_to(conn, frame).await?;
+            return Ok(());
         }
 
-        conn.write_all(data).await?;
+        write_frame_to(conn, frame).await?;
         let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
-        let mut payload_remaining = data.len();
+        let mut payload_remaining = data_len;
         for size in pkt_sizes {
             if size == crate::proxy::padding::CHECK_MARK {
                 if payload_remaining == 0 {
@@ -84,7 +82,7 @@ impl Session {
                 conn.write_all(&waste).await?;
             }
         }
-        Ok(data.len())
+        Ok(())
     }
 
     pub(super) async fn recv_loop(&self) -> io::Result<()> {
@@ -111,4 +109,25 @@ impl Session {
             self.handle_frame(cmd, sid, data).await?;
         }
     }
+}
+
+pub(super) async fn write_frame_to<W>(conn: &mut W, frame: Frame) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let header = frame_header(&frame);
+    let mut data = Buf::chain(&header[..], frame.data);
+    conn.write_all_buf(&mut data).await
+}
+
+fn frame_header(frame: &Frame) -> [u8; HEADER_OVERHEAD_SIZE] {
+    let mut header = [0u8; HEADER_OVERHEAD_SIZE];
+    header[0] = frame.cmd;
+    header[1..5].copy_from_slice(&frame.sid.to_be_bytes());
+    header[5..7].copy_from_slice(&(frame.data.len() as u16).to_be_bytes());
+    header
+}
+
+fn frame_len(frame: &Frame) -> usize {
+    HEADER_OVERHEAD_SIZE + frame.data.len()
 }
