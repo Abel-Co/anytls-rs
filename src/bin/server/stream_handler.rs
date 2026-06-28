@@ -8,7 +8,9 @@ use tokio::net::UdpSocket;
 
 const UOT_DEST_HOST_SUFFIX: &str = "udp-over-tcp.arpa";
 
-async fn handle_uot_stream(mut stream: Stream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_uot_stream(
+    mut stream: Stream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let request = uot::read_request(&mut stream).await?;
     log::debug!(
         "[Server][UOT] request is_connect={}, destination={}:{}",
@@ -52,10 +54,15 @@ async fn handle_uot_stream(mut stream: Stream) -> Result<(), Box<dyn std::error:
             destination.host,
             destination.port
         );
-        udp_socket.send_to(&data, destination.to_host_port()).await?;
+        udp_socket
+            .send_to(&data, destination.to_host_port())
+            .await?;
 
-        let recv_res =
-            tokio::time::timeout(std::time::Duration::from_millis(800), udp_socket.recv_from(&mut buf)).await;
+        let recv_res = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            udp_socket.recv_from(&mut buf),
+        )
+        .await;
         if let Ok(Ok((n, src))) = recv_res {
             log::debug!("[Server][UOT] udp response {} bytes from {}", n, src);
             if !is_connect {
@@ -83,7 +90,9 @@ async fn handle_uot_stream(mut stream: Stream) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-pub(crate) async fn handle_stream(mut stream: Stream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn handle_stream(
+    mut stream: Stream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let target = read_socks_addr(&mut stream).await?.to_host_port();
     log::info!("[Server] Proxy to {}", target);
 

@@ -1,4 +1,5 @@
-use anytls_rs::proxy::client_runtime;
+mod runtime;
+mod socks5;
 use anytls_rs::proxy::padding::DefaultPaddingFactory;
 use anytls_rs::proxy::session::Client;
 use anytls_rs::proxy::transport;
@@ -73,7 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 为每个连接创建新的任务
                 let client_clone = client.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = client_runtime::handle_client_connection(client_conn, client_clone).await {
+                    if let Err(e) =
+                        runtime::handle_client_connection(client_conn, client_clone).await
+                    {
                         error!("[Client] Connection error: {}", e);
                     }
                 });
