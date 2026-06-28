@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
+const MAX_ACTIVE_STREAMS_PER_SESSION: u32 = 8;
+
 struct IdleEntry {
     session: Arc<Session>,
     idle_since_ms: u64,
@@ -91,9 +93,11 @@ pub struct Client {
     dial_out: DialOutFunc,
     padding: Arc<PaddingFactory>,
     idle_sessions: Arc<Mutex<IdlePool>>,
+    active_sessions: Arc<Mutex<HashMap<usize, Arc<Session>>>>,
     idle_timeout: Duration,
     min_idle_sessions: usize,
     closed: Arc<AtomicBool>,
+    prewarm_running: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -108,9 +112,11 @@ impl Client {
             dial_out,
             padding,
             idle_sessions: Arc::new(Mutex::new(IdlePool::new())),
+            active_sessions: Arc::new(Mutex::new(HashMap::new())),
             idle_timeout,
             min_idle_sessions,
             closed: Arc::new(AtomicBool::new(false)),
+            prewarm_running: Arc::new(AtomicBool::new(false)),
         };
 
         let ctl = global_control();
@@ -143,8 +149,10 @@ impl Client {
         };
         let this = self.clone();
         let session_for_hook = Arc::clone(&session);
+        let stream_id = stream.id;
         stream.set_on_close(Box::new(move || {
             tokio::spawn(async move {
+                session_for_hook.finish_stream(stream_id).await;
                 this.return_to_idle(session_for_hook).await;
             });
         }));
@@ -154,6 +162,12 @@ impl Client {
     async fn open_stream_from_available_session(&self) -> io::Result<(Arc<Session>, Stream)> {
         let session = if let Some(session) = self.get_idle_session().await {
             log::debug!("Reusing idle session");
+            session
+        } else if let Some(session) = self.get_active_session().await {
+            log::debug!(
+                "Reusing active session, active_streams={}",
+                session.stream_count()
+            );
             session
         } else {
             let session = self.create_session().await?;
@@ -165,6 +179,7 @@ impl Client {
             Ok(stream) => Ok((session, stream)),
             Err(e) => {
                 let _ = session.close().await;
+                self.remove_active_session(&session).await;
                 Err(e)
             }
         }
@@ -188,16 +203,34 @@ impl Client {
         let mut idle_sessions = self.idle_sessions.lock().await;
         while let Some(entry) = idle_sessions.pop_back() {
             if !entry.session.is_closed() {
-                return Some(entry.session);
+                let session = entry.session;
+                self.ensure_min_idle_sessions_background();
+                return Some(session);
             }
         }
         None
+    }
+
+    async fn get_active_session(&self) -> Option<Arc<Session>> {
+        let mut active_sessions = self.active_sessions.lock().await;
+        active_sessions.retain(|_, session| !session.is_closed());
+        active_sessions
+            .values()
+            .filter(|session| {
+                !session.is_closed() && session.stream_count() < MAX_ACTIVE_STREAMS_PER_SESSION
+            })
+            .min_by_key(|session| session.stream_count())
+            .cloned()
     }
 
     async fn create_session(&self) -> io::Result<Arc<Session>> {
         let conn = (self.dial_out)().await?;
         let session = Arc::new(Session::new_client(conn, self.padding.clone()));
         session.run().await?;
+        self.active_sessions
+            .lock()
+            .await
+            .insert(session_key(&session), Arc::clone(&session));
         Ok(session)
     }
 
@@ -206,9 +239,18 @@ impl Client {
             return;
         }
         if session.is_closed() {
+            self.remove_active_session(&session).await;
+            return;
+        }
+        if session.stream_count() != 0 {
             return;
         }
 
+        self.insert_idle_session(session).await;
+        self.ensure_min_idle_sessions_background();
+    }
+
+    async fn insert_idle_session(&self, session: Arc<Session>) {
         let mut idle_sessions = self.idle_sessions.lock().await;
         idle_sessions.insert_or_refresh(session, now_unix_ms());
         let idle_pool_size = idle_sessions.len();
@@ -216,6 +258,13 @@ impl Client {
             "Session returned to idle pool, idle_pool_size={}",
             idle_pool_size
         );
+    }
+
+    async fn remove_active_session(&self, session: &Arc<Session>) {
+        self.active_sessions
+            .lock()
+            .await
+            .remove(&session_key(session));
     }
 
     async fn ensure_min_idle_sessions(&self) {
@@ -242,13 +291,31 @@ impl Client {
                 break;
             }
             match self.create_session().await {
-                Ok(session) => self.return_to_idle(session).await,
+                Ok(session) => self.insert_idle_session(session).await,
                 Err(e) => {
                     log::debug!("Prewarm session failed: {}", e);
                     break;
                 }
             }
         }
+    }
+
+    fn ensure_min_idle_sessions_background(&self) {
+        if self.min_idle_sessions == 0 || self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .prewarm_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let client = self.clone();
+        tokio::spawn(async move {
+            client.ensure_min_idle_sessions().await;
+            client.prewarm_running.store(false, Ordering::Release);
+        });
     }
 
     pub async fn cleanup_idle_sessions(&self) {
@@ -284,6 +351,7 @@ impl Client {
         }
 
         for session in to_close {
+            self.remove_active_session(&session).await;
             let _ = session.close().await;
         }
     }
@@ -308,6 +376,13 @@ impl Client {
             to_close.push(entry.session);
         }
         drop(idle_sessions);
+        {
+            let mut active_sessions = self.active_sessions.lock().await;
+            for session in active_sessions.values() {
+                to_close.push(Arc::clone(session));
+            }
+            active_sessions.clear();
+        }
 
         for session in to_close {
             session.close().await.ok();
@@ -335,9 +410,11 @@ impl Clone for Client {
             dial_out: self.dial_out.clone(),
             padding: self.padding.clone(),
             idle_sessions: self.idle_sessions.clone(),
+            active_sessions: self.active_sessions.clone(),
             idle_timeout: self.idle_timeout,
             min_idle_sessions: self.min_idle_sessions,
             closed: self.closed.clone(),
+            prewarm_running: self.prewarm_running.clone(),
         }
     }
 }

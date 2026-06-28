@@ -125,9 +125,7 @@ impl Session {
         }
         self.state.stream_count.fetch_add(1, Ordering::AcqRel);
 
-        if self.is_client
-            && stream_id >= 2
-            && self.state.peer_version.load(Ordering::Acquire) >= 2
+        if self.is_client && stream_id >= 2 && self.state.peer_version.load(Ordering::Acquire) >= 2
         {
             let (tx, rx) = oneshot::channel();
             {
@@ -170,6 +168,10 @@ impl Session {
         self.remove_stream(stream_id).await;
         self.write_control_frame(Frame::new(CMD_FIN, stream_id)).await?;
         Ok(())
+    }
+
+    pub async fn finish_stream(&self, stream_id: u32) {
+        self.remove_stream(stream_id).await;
     }
 
     pub(super) async fn remove_stream(&self, stream_id: u32) -> bool {
