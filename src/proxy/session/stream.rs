@@ -7,9 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    oneshot,
+};
 
-type PendingFrameSend = Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>;
+type PendingFrameSend =
+    Pin<Box<dyn Future<Output = Result<(), mpsc::error::SendError<Frame>>> + Send>>;
 
 /// Stream 实现 AsyncRead 和 AsyncWrite，提供读写缓冲区
 pub struct Stream {
@@ -101,7 +105,7 @@ impl AsyncRead for Stream {
         if let Some(data) = &self.read_buffer {
             let remaining = data.len() - self.read_offset;
             let to_copy = remaining.min(buf.remaining());
-            
+
             buf.put_slice(&data[self.read_offset..self.read_offset + to_copy]);
 
             let new_offset = self.read_offset + to_copy;
@@ -139,7 +143,11 @@ impl AsyncRead for Stream {
 }
 
 impl AsyncWrite for Stream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         if self.is_closed() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -149,9 +157,20 @@ impl AsyncWrite for Stream {
 
         if self.pending_send.is_none() {
             let frame = Frame::with_data(CMD_PSH, self.id, Bytes::copy_from_slice(buf));
-            let tx = self.frame_tx.clone();
-            self.pending_send = Some(Box::pin(async move { tx.send(frame).await }));
-            self.pending_send_len = buf.len();
+            match self.frame_tx.try_send(frame) {
+                Ok(()) => return Poll::Ready(Ok(buf.len())),
+                Err(TrySendError::Full(frame)) => {
+                    let tx = self.frame_tx.clone();
+                    self.pending_send = Some(Box::pin(async move { tx.send(frame).await }));
+                    self.pending_send_len = buf.len();
+                }
+                Err(TrySendError::Closed(_)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "session is closed",
+                    )));
+                }
+            }
         }
 
         if let Some(fut) = self.pending_send.as_mut() {
@@ -196,8 +215,20 @@ impl AsyncWrite for Stream {
 
         if self.pending_shutdown.is_none() {
             let frame = Frame::new(CMD_FIN, self.id);
-            let tx = self.frame_tx.clone();
-            self.pending_shutdown = Some(Box::pin(async move { tx.send(frame).await }));
+            match self.frame_tx.try_send(frame) {
+                Ok(()) => {
+                    self.mark_closed();
+                    return Poll::Ready(Ok(()));
+                }
+                Err(TrySendError::Full(frame)) => {
+                    let tx = self.frame_tx.clone();
+                    self.pending_shutdown = Some(Box::pin(async move { tx.send(frame).await }));
+                }
+                Err(TrySendError::Closed(_)) => {
+                    self.mark_closed();
+                    return Poll::Ready(Ok(()));
+                }
+            }
         }
 
         if let Some(fut) = self.pending_shutdown.as_mut() {
