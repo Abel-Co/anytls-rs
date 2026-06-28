@@ -102,5 +102,10 @@ pub fn pipe() -> (PipeReader, PipeWriter) {
         data_receiver: Some(rx),
     }));
 
-    (PipeReader { inner: inner.clone() }, PipeWriter { inner })
+    (
+        PipeReader {
+            inner: inner.clone(),
+        },
+        PipeWriter { inner },
+    )
 }

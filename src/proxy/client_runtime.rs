@@ -2,10 +2,10 @@ use crate::proxy::session::Client;
 use crate::proxy::socks5;
 use crate::proxy::uot;
 use log::{error, info};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::copy_bidirectional;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::UdpSocket;
 
 const UOT_DEST_HOST: &str = uot::MAGIC_ADDRESS;
 const UOT_DEST_PORT: u16 = 443;

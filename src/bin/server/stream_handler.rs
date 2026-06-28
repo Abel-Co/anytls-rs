@@ -1,8 +1,8 @@
 use anytls_rs::proxy::addr_codec::read_socks_addr;
 use anytls_rs::proxy::session::Stream;
 use anytls_rs::proxy::uot;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::copy_bidirectional;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 
@@ -71,11 +71,7 @@ async fn handle_uot_stream(mut stream: Stream) -> Result<(), Box<dyn std::error:
                         port: v6.port(),
                     },
                 };
-                uot::write_uot_addr_port(
-                    &mut stream,
-                    &src_addr,
-                )
-                .await?;
+                uot::write_uot_addr_port(&mut stream, &src_addr).await?;
             }
             stream.write_u16(n as u16).await?;
             stream.write_all(&buf[..n]).await?;
